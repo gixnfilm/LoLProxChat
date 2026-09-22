@@ -1,0 +1,6 @@
+# Files executed on Linux CI runners must keep LF line endings regardless of a
+# contributor's core.autocrlf setting — CRLF in a workflow run: block breaks the
+# shell with `$'\r': command not found`.
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.sh   text eol=lf

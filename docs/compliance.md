@@ -1,0 +1,45 @@
+# Compliance with Riot's Third-Party Policy
+
+LoLProxChat is built to stay within the categories Riot Games explicitly publishes as allowed for third-party tools. The mechanisms it uses are the same as Discord's overlay, Mobalytics, Blitz, Porofessor, and similar widely-used apps that have operated continuously alongside League of Legends for years.
+
+## What it does (Riot's "allowed" column)
+
+- Reads the **League Client (LCU) API** for game phase and your summoner identity, and the **Live Client Data API** (`https://127.0.0.1:2999`) for the player roster. Both are interfaces Riot specifically designed for third-party use. See the [LCU policy](https://www.riotgames.com/en/DevRel/changes-to-the-lcu-api-policy).
+- Captures the **minimap region only** via standard Win32 `BitBlt` — the same mechanism OBS, ShareX, and the Snipping Tool use. No video frames from the game render path are touched.
+- Renders an **overlay window** that paints **outside** the LoL process — never injects, never reads game memory, never hooks DirectX. Riot's own Vanguard FAQ confirms: *"Overlays and internal tools using the API, game client, and in-game APIs should continue to function"* ([Vanguard FAQ](https://www.riotgames.com/en/DevRel/vanguard-faq)).
+
+## What it explicitly does NOT do (Riot ban triggers)
+
+- ❌ No game memory reading — Vanguard blocks this, and we never attempt it.
+- ❌ No process injection, DLL loading, or DirectX hooking.
+- ❌ No network packet interception, modification, or replay.
+- ❌ No automation, scripting, or bot behavior — the app never takes any in-game action on your behalf.
+- ❌ No decision-making aids — no enemy ult timers, no warned-by, no jungle timers, no skill suggestions.
+- ❌ No exposure of obfuscated information — no fog-of-war reveals, no warded-by indicators, no enemy item builds, no spectator-mode data.
+- ❌ No in-game advertising (banned by Riot in May 2025).
+- ❌ No paid tier or freemium gating — Riot's monetization rules require a free tier; LoLProxChat is fully open source and free.
+
+## Specifically: the proximity audio
+
+The volume falloff drops to zero at ~1350 game units — roughly a champion's vision range. You only hear enemies who are close enough that the game would already give you visual indicators of their presence (minimap icon when they walk past warded ground, champion model when they enter your vision); they fade in faintly at that edge and grow louder as they approach.
+
+The app does not reveal *where* an enemy is — only that one is somewhere within hearing range. This is strictly less information than Discord voice chat with the same opponent already provides (which has zero distance modulation).
+
+For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, and the server-side quantization + jitter mitigations applied, see [`threat-model.md`](threat-model.md).
+
+## Riot Developer Portal status
+
+LoLProxChat is **registered and approved** on the Riot Developer Portal — **App ID 809090**. The registration documents the LCU + Live Client Data endpoints used and the architectural approach (Tauri overlay, no memory reads, no injection). This is the official sign-off that the app's design fits Riot's allowed-tools category.
+
+## Honest caveats
+
+- **Korea region restriction.** Riot has restricted LCU-using apps in Korea as of the LCU API policy change. The app does not enforce a region check programmatically — users in Korean regions should not run it.
+- **"Unsupported" endpoint status.** LCU and Live Client Data are officially listed as "unsupported." Riot can change endpoint shapes anytime, which would break the app (but won't ban users).
+- **This is not legal advice.** Nothing here constitutes legal advice or a guarantee against action by Riot. This document describes the design intent and the published rules, not a contract.
+
+## References
+
+- [League of Legends Third Party Applications policy](https://support-leagueoflegends.riotgames.com/hc/en-us/articles/225266848-Third-Party-Applications)
+- [Riot Developer Portal — General Policies](https://developer.riotgames.com/policies/general)
+- [Changes to the LCU API Policy](https://www.riotgames.com/en/DevRel/changes-to-the-lcu-api-policy)
+- [Vanguard FAQ for Third Party Applications](https://www.riotgames.com/en/DevRel/vanguard-faq)

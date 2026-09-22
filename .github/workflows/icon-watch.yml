@@ -1,0 +1,106 @@
+name: Icon watch (retrain on icon changes)
+
+# Daily (and on demand): scrape the latest champion icons from Community Dragon.
+# If the icon set changed — a new champion, skin, or rework — retrain the minimap
+# tracking classifier, bump the patch version, and open a PR with the new model.
+# A human validates tracking in a real game, then merges; the version bump landing
+# on main then triggers release.yml to build a draft release.
+#
+# One-time repo setting required for the PR step:
+#   Settings -> Actions -> General -> Workflow permissions ->
+#     "Allow GitHub Actions to create and approve pull requests"  (enabled)
+# Without it the branch is still pushed, but you must open the PR by hand.
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # daily 09:00 UTC (no-ops fast when icons are unchanged)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Scraper + orchestrator use only Node built-ins, so no `npm install` here.
+      - name: Scrape latest icons (Community Dragon)
+        run: npm run update-icons
+
+      - name: Detect icon-set change
+        id: diff
+        run: |
+          # Trigger only when a champion or skin is ADDED/REMOVED — not on icon
+          # byte-hash churn. Community Dragon periodically re-encodes the PNGs
+          # (same pixels, different bytes), which would otherwise churn nearly
+          # every hash and open a spurious retrain PR + release.
+          if node scripts/icon-set-changed.mjs; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install training deps (CPU torch)
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r scripts/requirements.txt
+
+      - name: Retrain classifier
+        if: steps.diff.outputs.changed == 'true'
+        run: npm run train-model # --skip-scrape: icons are already fresh
+
+      - name: Compose PR body
+        if: steps.diff.outputs.changed == 'true'
+        id: meta
+        run: |
+          node scripts/icon-diff-summary.mjs > pr-body.md
+          echo "patch=$(node -e "process.stdout.write(require('./models/champion-icons-manifest.json').version)")" >> "$GITHUB_OUTPUT"
+          echo "---- PR body ----"; cat pr-body.md
+
+      - name: Bump version + changelog
+        if: steps.diff.outputs.changed == 'true'
+        id: bump
+        env:
+          PATCH: ${{ steps.meta.outputs.patch }}
+        run: |
+          APP=$(node scripts/bump-version.mjs --type patch \
+            --changelog "### Changed\n- Champion classifier retrained on the current-patch Community Dragon icon set (game patch ${PATCH}).")
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "App version bumped to $APP"
+
+      - name: Open pull request
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PATCH: ${{ steps.meta.outputs.patch }}
+          APP: ${{ steps.bump.outputs.app }}
+        run: |
+          BRANCH="auto/icon-refresh-${PATCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add models/champion_classifier.onnx models/champion_labels.json \
+                  models/champion-icons-manifest.json models/champion-classifier-metrics.json \
+                  src-tauri/Cargo.toml src-tauri/Cargo.lock CHANGELOG.md
+          git commit -m "feat: refresh champion classifier for game patch ${PATCH} (v${APP})"
+          git push -f -u origin "$BRANCH"
+          # Create the PR, or just update the body if one already exists for this branch.
+          gh pr create --base main --head "$BRANCH" \
+            --title "Refresh champion classifier — game patch ${PATCH} (v${APP})" \
+            --body-file pr-body.md \
+            || gh pr edit "$BRANCH" --body-file pr-body.md
