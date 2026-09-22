@@ -55,13 +55,61 @@
           <span id="volume-label" class="setting-value-label">100</span>
         </div>
       </div>
+      <div class="settings-heading">Voice Mixer</div>
+      <div class="setting-row">
+        <label title="Output level for every voice, 0-200%. Above 100% amplifies past the original recording.">Master Vol</label>
+        <div class="setting-value-group">
+          <input id="input-master-vol" type="range" min="0" max="200" value="100">
+          <span id="master-vol-label" class="setting-value-label">100</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label title="Extra gain for teammates, 0-200%.">Team Vol</label>
+        <div class="setting-value-group">
+          <input id="input-team-vol" type="range" min="0" max="200" value="100">
+          <span id="team-vol-label" class="setting-value-label">100</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label title="Extra gain for enemies, 0-300%. Enemies arrive attenuated by distance, so they usually need more than 100%.">Enemy Vol</label>
+        <div class="setting-value-group">
+          <input id="input-enemy-vol" type="range" min="0" max="300" value="160">
+          <span id="enemy-vol-label" class="setting-value-label">160</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label title="OFF = no distance falloff. ENEMY = only enemies fade with distance. ALL = teammates fade too. Takes effect on the next position update.">Proximity</label>
+        <button id="btn-proximity-mode" class="icon-btn">ALL</button>
+      </div>
+      <div class="setting-row">
+        <label title="How loud someone still is at the very edge of hearing range, 0-100%. The stock curve drops to near-zero there, which is why far enemies were inaudible.">Min Vol (far)</label>
+        <div class="setting-value-group">
+          <input id="input-floor" type="range" min="0" max="100" value="25">
+          <span id="floor-label" class="setting-value-label">25</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label title="Distance in game units that still plays at full volume before the fade starts. 300 is roughly melee/short-trade range.">Fade Start</label>
+        <div class="setting-value-group">
+          <input id="input-near-range" type="range" min="0" max="1000" step="25" value="300">
+          <span id="near-range-label" class="setting-value-label">300</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label title="Shape of the fade. Below 100 fades gently (people stay loud further out); above 100 fades steeply.">Fade Curve</label>
+        <div class="setting-value-group">
+          <input id="input-fade-curve" type="range" min="30" max="200" step="5" value="70">
+          <span id="fade-curve-label" class="setting-value-label">70</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label title="WebAudio playback. Required for any volume above 100%. Turn OFF only if you hear echo or doubled voices — that reverts to the original capped playback path.">Audio Boost</label>
+        <button id="btn-audio-boost" class="icon-btn">ON</button>
+      </div>
+      <div class="settings-heading">Other</div>
       <div class="setting-row">
         <label title="Routes all voice through the TURN relay so peers never see your public IP. Adds ~20-100ms latency. Takes effect on next peer connection.">Hide IP (Force TURN)</label>
         <button id="btn-force-turn" class="icon-btn">OFF</button>
-      </div>
-      <div class="setting-row">
-        <label title="When ON, teammates fade with distance just like enemies. When OFF (default), teammates are always at full volume. Takes effect on the next position update.">Ally proximity</label>
-        <button id="btn-ally-proximity" class="icon-btn">OFF</button>
       </div>
       <div class="setting-row">
         <label>Debug</label>

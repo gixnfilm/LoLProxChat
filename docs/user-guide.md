@@ -33,7 +33,27 @@ Each player row has:
 | **Input Mode** | "Always Open" (default) — mic is always live unless self-muted. "Push to Talk" — hold the bound PTT key (default Caps Lock) to transmit; it works while League has focus. |
 | **PTT Key** | The push-to-talk key. Default Caps Lock (the keyboard LED is auto-flipped back so it doesn't toggle on every press). Click the button to capture a new key; the app rejects common LoL bindings (Q/W/E/R/D/F/B/P) and modifier-only keys. |
 | **Toggle-mute Key** | Optional global hotkey to flip self-mute on/off. Unbound by default — click the button to bind. |
-| **Mic Volume** | Pre-transmission gain on your mic, 0-100%. Useful if your hardware mic is too quiet or too hot. |
+| **Mic Volume** | Pre-transmission gain on your mic, 0-100%. Useful if your hardware mic is too quiet or too hot. Persists across launches. |
+
+### Voice Mixer
+
+How loud everyone else is for you. All of it persists across games and restarts.
+
+| Setting | What it does |
+|---|---|
+| **Master Vol** | Output level for every voice, 0-200%. Above 100% amplifies past the original recording. |
+| **Team Vol** | Extra gain for teammates, 0-200%. |
+| **Enemy Vol** | Extra gain for enemies, 0-300%. Defaults to **160%** — enemies always arrive attenuated by distance, so they need more headroom than allies to be comfortably audible. |
+| **Proximity** | **OFF** — nobody fades, everyone you can hear plays flat. **ENEMY** — only enemies fade with distance. **ALL** — teammates fade too. Takes effect on the next position update; no reconnect. |
+| **Min Vol (far)** | How loud someone still is at the very edge of hearing range, 0-100%. The stock curve drops to ~7% at 1300 units, which is inaudible in practice — 25% keeps distant players present without drowning close ones. |
+| **Fade Start** | Distance in game units that still plays at full volume before the fade begins. 300 is roughly short-trade range. |
+| **Fade Curve** | Shape of the fade. Below 100 fades gently (people stay loud further out); above 100 fades steeply, so only close range is loud. |
+| **Audio Boost** | The WebAudio playback path. **Required for any volume above 100%** — turning it off reverts to the original playback, which the browser caps at 100%. Only switch it off if you hear echo or doubled voices. |
+
+> **Hearing range is set by the server and can't be raised here.** Players
+> further than ~1350 units (a champion's vision range) are not sent to you at
+> all, so no slider can bring them back. Everything inside that radius is
+> yours to shape.
 | **Hide IP (Force TURN)** | Routes all voice through the TURN relay so peers in your match never see your public IP. Defends against DDoS / port-scan attempts from random players. Adds ~20-100 ms latency. Default off; takes effect on the next peer connection. See [`threat-model.md`](threat-model.md) for the full discussion. |
 | **Debug** | Toggles diagnostic mode — shows a filtered minimap thumbnail with the tracked position marked, exposes the Scan Rate slider, and starts writing a debug log to disk. Off by default; turn on only when investigating a problem or asked by a maintainer. |
 | **Debug Logs → OPEN** | Launches Explorer at `%LOCALAPPDATA%\com.proxchat.app\` so you can grab `lolproxchat.log` to attach to a GitHub issue. |
@@ -74,7 +94,9 @@ The log is plain text. It contains your summoner name and nearby players' summon
 | Audio cuts out or crackles | Usually the minimap scan competing for the main thread at a high scan rate. Lower the **Scan Rate** slider to ~50 (Debug). |
 | Connected to a peer but hear nothing | First check your **Output Device** (Settings) — the wrong default device is the most common cause. Then turn on Debug and confirm the connection reaches `connected`; if it shows `failed`, you're behind a restrictive network and need **Hide IP (Force TURN)**. |
 | Can't hear one specific player | Check their per-player volume slider isn't at zero and their **MUTE** isn't on. |
-| Faint or no audio from a nearby enemy | Enemy voices are quiet at the edge of champion-vision range and grow louder as they approach — that's by design. Allies are always full volume. |
+| Faint or no audio from a nearby enemy | Raise **Settings → Enemy Vol** (up to 300%) and **Min Vol (far)**. Enemy voices fade with distance by design; those two sliders decide how much. |
+| Everyone suddenly sounds doubled / echoey | Turn **Settings → Audio Boost** OFF. That reverts to the original playback path (capped at 100%) and is worth reporting. |
+| Teammates don't get quieter when they walk away | **Settings → Proximity** must be **ALL**. On **ENEMY** (or **OFF**) teammates stay at full volume. |
 | Something else seems off | Make sure you're on the latest version: turn on **Auto-update**, or grab the newest build from [Releases](https://github.com/danthi123/LoLProxChat/releases/latest). |
 
 ## Updating

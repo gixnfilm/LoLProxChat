@@ -1,4 +1,5 @@
 import { getIceServers } from '../core/config';
+import { MAX_TOTAL_GAIN } from './proximity-curve';
 import { getForceTurnRelay } from './privacy';
 
 // Time-based EMA on per-peer volume targets. Damps CV-jitter spikes without
@@ -7,8 +8,10 @@ import { getForceTurnRelay } from './privacy';
 //     start playing at 1.0 before the proximity pipeline catches up.
 //   • Alpha is capped at 0.3 so even a long gap between updates (e.g. a peer
 //     re-entering hearing range after going far away) ramps over multiple
-//     ticks instead of snapping to a loud value. At ~3 FPS update cadence,
-//     the smoother reaches ~95% of target in about a second.
+//     ticks instead of snapping to a loud value. At the 10 Hz positionTick
+//     cadence the smoother reaches ~95% of target in about a second.
+// Targets are clamped to [0, MAX_TOTAL_GAIN] rather than [0, 1]: playback runs
+// through a GainNode that can amplify past unity (see applyGain).
 // Exported so tests can verify the math without a real RTCPeerConnection.
 export function nextSmoothedVolume(
   prev: number | null,
@@ -16,7 +19,9 @@ export function nextSmoothedVolume(
   nowMs: number,
   lastUpdateMs: number,
 ): number {
-  const clamped = Math.max(0, Math.min(1, target));
+  const clamped = Number.isFinite(target)
+    ? Math.max(0, Math.min(MAX_TOTAL_GAIN, target))
+    : 0;
   if (prev === null) return clamped;
   const dtSec = (nowMs - lastUpdateMs) / 1000;
   const alpha = Math.min(0.3, 1 - Math.exp(-dtSec / 0.3));
@@ -51,11 +56,23 @@ export class PeerConnection {
   private hasRemoteDescription = false;
   readonly remoteName: string;
 
-  // Playback is element-only: the remote stream plays through `audioElement`,
-  // whose .volume carries the proximity gain. An earlier parallel WebAudio
-  // gain-node path was removed — the muted element wasn't reliably silent in
-  // WebView2, so both played at once, causing echo/double + a muddied level
-  // (issues #19 / #21).
+  // Playback has two paths and exactly one of them is ever audible.
+  //
+  // • Graph path (default): remoteStream → sourceNode → gainNode → the shared
+  //   master bus owned by AudioService. Only this path can exceed unity gain,
+  //   which is the whole point — HTMLMediaElement.volume is hard-capped at 1.0,
+  //   so on the element path a peer can never be louder than as-recorded. That
+  //   cap is why distant enemies were inaudible (#21).
+  // • Element path (fallback, Settings → Audio Boost OFF): the upstream
+  //   behaviour, `audioElement.volume` carries the gain, capped at 1.0.
+  //
+  // The element stays attached either way — it keeps the remote track pulled
+  // and is where autoplay unblocking happens — but on the graph path it is
+  // muted AND volume-zeroed AND never written to again. A previous attempt at
+  // a parallel WebAudio path played through both at once (echo + muddied
+  // level, #19/#21) and was deleted wholesale in v0.5.3, taking the ability to
+  // amplify with it. `usingGraph` is the single source of truth for which
+  // path owns the level.
   // Default to silent. Volume is supposed to come from the proximity pipeline
   // (applyPeerVolumes → setVolume). If a peer connects before that pipeline
   // has produced a value for them (e.g. during tracking SCANNING state where
@@ -64,6 +81,11 @@ export class PeerConnection {
   // map at startup" bug reported on #6 / #7.
   private targetVolume = 0;
   private muted = false;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
+  private gainNode: GainNode | null = null;
+  private graphCtx: AudioContext | null = null;
+  private graphDestination: AudioNode | null = null;
+  private usingGraph = false;
   // Outer-loop EMA on volume targets so brief CV tracking glitches don't
   // produce audible dropouts. null = first call (snap to value, no smoothing).
   private smoothedVolume: number | null = null;
@@ -91,7 +113,7 @@ export class PeerConnection {
     this.audioElement.autoplay = true;
     this.audioElement.srcObject = this.remoteStream;
     // Start silent; the proximity pipeline (applyPeerVolumes → setVolume) sets
-    // the real gain. The element is the sole audible path (see field comment).
+    // the real gain on whichever path is active (see field comment).
     this.audioElement.volume = 0;
 
     this.pc.onicecandidate = (event) => {
@@ -106,6 +128,10 @@ export class PeerConnection {
     this.pc.ontrack = (event) => {
       console.log('[WebRTC] Got remote track from', remoteName, 'kind:', event.track.kind);
       this.remoteStream.addTrack(event.track);
+      // MediaStreamAudioSourceNode binds the stream's first audio track at
+      // construction and does NOT follow tracks added later — so the graph can
+      // only be built now, not when the peer object was created.
+      this.connectGraph();
       // Ensure audio plays (autoplay may be blocked by Chromium policy)
       this.tryPlay();
     };
@@ -149,10 +175,88 @@ export class PeerConnection {
     }
   }
 
-  private applyGain(value: number): void {
-    // Element-only playback. Per-tick EMA smoothing (setVolume) keeps the steps
-    // small enough to be click-free without WebAudio ramping.
-    this.audioElement.volume = Math.max(0, Math.min(1, value));
+  /**
+   * Hand this peer the shared playback bus. Safe to call before the remote
+   * track arrives — the nodes are built in `ontrack` (see connectGraph).
+   * Passing `null` tears the graph down and reverts to element playback.
+   */
+  setPlaybackGraph(ctx: AudioContext | null, destination: AudioNode | null): void {
+    if (!ctx || !destination) {
+      this.detachGraph();
+      return;
+    }
+    if (this.graphCtx === ctx && this.graphDestination === destination) return;
+    this.detachGraph();
+    this.graphCtx = ctx;
+    this.graphDestination = destination;
+    this.connectGraph();
+  }
+
+  private connectGraph(): void {
+    if (this.usingGraph || !this.graphCtx || !this.graphDestination) return;
+    if (this.remoteStream.getAudioTracks().length === 0) return;
+    try {
+      this.sourceNode = this.graphCtx.createMediaStreamSource(this.remoteStream);
+      this.gainNode = this.graphCtx.createGain();
+      this.gainNode.gain.value = 0;
+      this.sourceNode.connect(this.gainNode);
+      this.gainNode.connect(this.graphDestination);
+      this.usingGraph = true;
+      // Hand the level over to the gain node and keep the element permanently
+      // silent — belt and braces, because a single audible element here is the
+      // v0.5.3 double-playback regression.
+      this.audioElement.muted = true;
+      this.audioElement.volume = 0;
+      console.log('[WebRTC] WebAudio playback graph attached for', this.remoteName);
+      this.applyGain(this.muted ? 0 : this.targetVolume);
+    } catch (e) {
+      console.warn('[WebRTC] WebAudio graph attach failed for', this.remoteName,
+        '— falling back to element playback:', e);
+      this.teardownNodes();
+      this.usingGraph = false;
+      if (!this.muted) this.audioElement.muted = false;
+      this.applyGain(this.muted ? 0 : this.targetVolume);
+    }
+  }
+
+  private teardownNodes(): void {
+    try { this.sourceNode?.disconnect(); } catch { /* already gone */ }
+    try { this.gainNode?.disconnect(); } catch { /* already gone */ }
+    this.sourceNode = null;
+    this.gainNode = null;
+  }
+
+  private detachGraph(): void {
+    if (!this.graphCtx && !this.usingGraph) return;
+    this.teardownNodes();
+    this.graphCtx = null;
+    this.graphDestination = null;
+    this.usingGraph = false;
+    this.audioElement.muted = this.muted;
+    this.applyGain(this.muted ? 0 : this.targetVolume);
+  }
+
+  /** True while the WebAudio path owns the level (i.e. gain can exceed 1.0). */
+  isUsingGraph(): boolean {
+    return this.usingGraph;
+  }
+
+  private applyGain(value: number, tauSec = 0.08): void {
+    const v = Number.isFinite(value) ? Math.max(0, value) : 0;
+    if (this.usingGraph && this.gainNode && this.graphCtx) {
+      const g = Math.min(MAX_TOTAL_GAIN, v);
+      try {
+        // Ramp in the audio thread. The 10 Hz EMA only moves the *target*;
+        // setTargetAtTime turns each step into a continuous glide, so the
+        // staircase of discrete element.volume writes is gone.
+        this.gainNode.gain.setTargetAtTime(g, this.graphCtx.currentTime, tauSec);
+      } catch {
+        this.gainNode.gain.value = g;
+      }
+      return;
+    }
+    // Element path — hard-capped at unity by the media element itself.
+    this.audioElement.volume = Math.min(1, v);
   }
 
   private tryPlay(): void {
@@ -244,7 +348,25 @@ export class PeerConnection {
     this.pendingCandidates = [];
   }
 
-  setVolume(volume: number): void {
+  /**
+   * `immediate` bypasses the EMA for user-driven changes (the per-row slider).
+   * Routing those through the smoother made the slider feel broken: dragging
+   * fires ~60 events/sec, each with dt ≈ 16 ms → alpha ≈ 0.05, so the gain
+   * crawled and never reached the slider's own value. Worse, every one of those
+   * events overwrote `lastSetVolumeMs`, so the next proximity tick also saw a
+   * tiny dt and a tiny alpha — responsiveness degraded *while* the user was
+   * interacting with it. The immediate path deliberately leaves
+   * `lastSetVolumeMs` alone so it can't poison the proximity cadence.
+   */
+  setVolume(volume: number, immediate = false): void {
+    if (!Number.isFinite(volume)) return;
+    if (immediate) {
+      const v = Math.max(0, Math.min(MAX_TOTAL_GAIN, volume));
+      this.smoothedVolume = v;
+      this.targetVolume = v;
+      if (!this.muted) this.applyGain(v, 0.02);
+      return;
+    }
     const now = performance.now();
     this.smoothedVolume = nextSmoothedVolume(this.smoothedVolume, volume, now, this.lastSetVolumeMs);
     this.lastSetVolumeMs = now;
@@ -253,13 +375,18 @@ export class PeerConnection {
   }
 
   mute(): void {
+    if (this.muted) return;
     this.muted = true;
     this.audioElement.muted = true;
+    if (this.usingGraph) this.applyGain(0);
   }
 
   unmute(): void {
+    if (!this.muted) return;
     this.muted = false;
-    this.audioElement.muted = false;
+    // On the graph path the element must stay muted forever — it is a silent
+    // keep-alive sink, and un-muting it is exactly the double-playback bug.
+    if (!this.usingGraph) this.audioElement.muted = false;
     this.applyGain(this.targetVolume);
   }
 
@@ -268,6 +395,10 @@ export class PeerConnection {
       clearInterval(this.statsIntervalId);
       this.statsIntervalId = null;
     }
+    this.teardownNodes();
+    this.graphCtx = null;
+    this.graphDestination = null;
+    this.usingGraph = false;
     this.remoteStream.getTracks().forEach((t) => t.stop());
     this.pc.close();
     this.audioElement.pause();

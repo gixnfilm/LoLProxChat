@@ -4,6 +4,69 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.6.0] — 2026-09-22
+
+Fork release. Output levels are adjustable for the first time, and distance
+falloff is configurable instead of fixed.
+
+### Added
+- **Voice Mixer (Settings).** Master / Team / Enemy volume sliders, a
+  three-state **Proximity** control (OFF / ENEMY / ALL), and three knobs that
+  shape the distance falloff: **Min Vol (far)**, **Fade Start**, **Fade Curve**.
+  Everything persists across games and app restarts.
+- **Volumes above 100% are now possible at all.** Peer playback moved from
+  `HTMLAudioElement.volume` — hard-capped at 1.0 by the browser, so nothing
+  could ever be louder than as-recorded — to a WebAudio graph
+  (per-peer gain → shared bus → compressor → output). Enemy volume defaults to
+  160%, which is the direct answer to "enemies are super hard to hear" (#21).
+  A master-bus compressor keeps the boost from clipping and lifts quiet speech.
+  Settings → **Audio Boost** reverts to the old capped path if the WebAudio
+  path ever misbehaves.
+- **Min Vol (far)** keeps distant players audible. The server curve
+  (`1 - (d/1350)²`) collapses to 0.07 at 1300 units, which is inaudible in
+  practice; the client now re-shapes it against a configurable floor (25% by
+  default). The re-shaping works by inverting the server curve to recover the
+  real distance, so it needs no server change and still respects the
+  server-authoritative range cut-off.
+- **Proximity: ALL** makes teammates fade with distance too (this sends the
+  existing `allyProximity` flag the server already understands).
+
+### Fixed
+- **Volume no longer freezes when minimap tracking hiccups.** Three paths in
+  the position tick — no position yet, CV holding for >2 s, and a failed
+  `/compute-volumes` request — returned early without touching the mixer, so
+  every peer stayed pinned at its last gain indefinitely. They now fall back to
+  "teammates at full volume, enemies fade out", which is the honest degradation
+  when our own coordinates are unknown.
+- **Per-player volume sliders respond immediately.** They were routed through
+  the same EMA smoother as proximity: at ~60 drag events/sec alpha fell to
+  ~0.05, so the gain crawled and never reached the slider's own value — and each
+  event poisoned the timing of the next proximity tick. User-driven changes now
+  bypass the smoother.
+- **Per-player volumes and Mic Volume persist.** A new `AudioService` is built
+  per game while the overlay window is not reloaded, so the UI kept showing the
+  old positions while the engine silently ran at its defaults.
+- **A malformed `/compute-volumes` response no longer kills the tick.** The
+  body was used unvalidated and a single `null` entry threw on `.toFixed()`,
+  taking every peer's volume with it. Non-numeric entries are now dropped.
+- **Mic gain is clamped, ramped, and NaN-proof.** An empty slider field parsed
+  to `NaN`, and assigning that to an AudioParam throws and kills the mic chain.
+- Per-peer bookkeeping is cleared on disconnect, so a reconnecting peer can't
+  inherit a stale gain.
+- Corrected stale comments that misdescribed the audio path (claimed GainNode
+  smoothing that didn't exist, "~3 FPS" for a 10 Hz tick, "60s" for the 5 s
+  stale-position window).
+
+### Notes
+- Fork of [danthi123/LoLProxChat](https://github.com/danthi123/LoLProxChat)
+  v0.5.7, AGPLv3. All changes are client-side; it still talks to the upstream
+  signaling server at `proxchat.dant123.com`.
+- Hearing range beyond 1350 units remains impossible: the server omits
+  out-of-range peers from the response entirely rather than sending them at
+  volume 0, so there is nothing for the client to re-shape.
+- Client tests: 156 (was 110).
+
+
 ## [v0.5.7] — 2026-07-09
 
 ### Fixed
@@ -338,6 +401,7 @@ All notable changes to this project are documented here. Format adapted from [Ke
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.6.0]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.6.0
 [v0.5.7]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.7
 [v0.5.6]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.6
 [v0.5.5]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.5

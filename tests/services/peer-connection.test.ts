@@ -1,14 +1,26 @@
 import { nextSmoothedVolume } from '../../src/services/peer-connection';
+import { MAX_TOTAL_GAIN } from '../../src/services/proximity-curve';
 
 describe('nextSmoothedVolume', () => {
   test('first call (prev=null) snaps directly to the target', () => {
     expect(nextSmoothedVolume(null, 0.8, 1000, 0)).toBe(0.8);
   });
 
-  test('clamps target to [0, 1]', () => {
-    expect(nextSmoothedVolume(null, 1.5, 0, 0)).toBe(1);
+  test('clamps target to [0, MAX_TOTAL_GAIN]', () => {
+    // The ceiling is no longer 1.0: the boost path amplifies past unity, so
+    // the smoother has to be able to carry those targets. It still must not
+    // pass an unbounded value through to an AudioParam.
+    expect(nextSmoothedVolume(null, 1.5, 0, 0)).toBe(1.5);
+    expect(nextSmoothedVolume(null, 99, 0, 0)).toBe(MAX_TOTAL_GAIN);
     expect(nextSmoothedVolume(null, -0.3, 0, 0)).toBe(0);
-    expect(nextSmoothedVolume(0.5, 99, 100, 0)).toBeLessThanOrEqual(1);
+    expect(nextSmoothedVolume(0.5, 99, 100, 0)).toBeLessThanOrEqual(MAX_TOTAL_GAIN);
+  });
+
+  test('a non-finite target is treated as silence, not propagated', () => {
+    // updateSettings / the server response are both `any`-typed upstream;
+    // NaN reaching an AudioParam assignment throws and kills playback.
+    expect(nextSmoothedVolume(null, NaN, 0, 0)).toBe(0);
+    expect(Number.isFinite(nextSmoothedVolume(0.5, NaN, 100, 0))).toBe(true);
   });
 
   test('short dt produces a small step toward the target', () => {

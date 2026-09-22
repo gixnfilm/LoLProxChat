@@ -9,6 +9,27 @@ interface VolumeResponse {
   peerVolumes: Record<string, number>;
 }
 
+/**
+ * Keep only numeric, finite peer volumes.
+ *
+ * The response used to be handed back straight from `resp.json()` with no
+ * checking, and the audio layer immediately called `.toFixed()` on every
+ * value — so one `null` or string entry threw before a single gain was
+ * applied, taking the whole tick (and every peer's volume) with it. Bad
+ * entries are dropped rather than coerced: a peer missing from the map is
+ * already meaningful ("not audible"), which is the safe reading of garbage.
+ *
+ * Exported for unit testing.
+ */
+export function sanitizePeerVolumes(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, number> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === 'number' && Number.isFinite(value)) out[name] = value;
+  }
+  return out;
+}
+
 export class VolumeClient {
   private endpoint: string;
 
@@ -53,7 +74,8 @@ export class VolumeClient {
         throw new Error(`Volume API error: ${resp.status}`);
       }
 
-      return resp.json();
+      const body = await resp.json();
+      return { peerVolumes: sanitizePeerVolumes(body?.peerVolumes) };
     } finally {
       clearTimeout(timeoutId);
     }

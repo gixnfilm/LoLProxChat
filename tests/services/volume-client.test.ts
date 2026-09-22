@@ -1,4 +1,4 @@
-import { VolumeClient } from '../../src/services/volume-client';
+import { VolumeClient, sanitizePeerVolumes } from '../../src/services/volume-client';
 
 // volume-client is pure transport; stub fetch and assert what we put on the wire.
 // The #22 ally-proximity flag is the contract that matters here: a field-name typo
@@ -36,5 +36,24 @@ describe('VolumeClient.computeVolumes', () => {
 
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.allyProximity).toBe(false);
+  });
+});
+
+describe('sanitizePeerVolumes', () => {
+  test('keeps finite numbers', () => {
+    expect(sanitizePeerVolumes({ Ahri: 0.5, Zed: 0 })).toEqual({ Ahri: 0.5, Zed: 0 });
+  });
+
+  test('drops entries that would have thrown on .toFixed()', () => {
+    // One bad value used to take the whole tick down — and with it every
+    // peer's gain, not just the malformed one.
+    expect(sanitizePeerVolumes({ Ahri: 0.5, Zed: null, Yas: 'loud', Kat: NaN }))
+      .toEqual({ Ahri: 0.5 });
+  });
+
+  test('a non-object body yields an empty map rather than throwing', () => {
+    expect(sanitizePeerVolumes(null)).toEqual({});
+    expect(sanitizePeerVolumes(undefined)).toEqual({});
+    expect(sanitizePeerVolumes('nope')).toEqual({});
   });
 });

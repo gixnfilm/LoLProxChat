@@ -33,6 +33,15 @@ describe('computeFinalPeerVolume', () => {
   test('proximity 1.0 × slider passes the slider through', () => {
     expect(computeFinalPeerVolume(1.0, 0.7)).toBeCloseTo(0.7);
   });
+
+  test('the optional group/master gains amplify past the old 1.0 ceiling', () => {
+    // Playback used to be HTMLAudioElement.volume, hard-capped at 1.0, so no
+    // amount of configuration could make a quiet enemy louder. These two
+    // arguments are the fix; defaulting them to 1 keeps every case above
+    // describing the unchanged behaviour.
+    expect(computeFinalPeerVolume(1.0, 1.0, 1.6, 1.0)).toBeCloseTo(1.6);
+    expect(computeFinalPeerVolume(0.5, 1.0, 2.0, 1.5)).toBeCloseTo(1.5);
+  });
 });
 
 describe('resolveProximityTargets', () => {

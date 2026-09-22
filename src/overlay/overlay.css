@@ -224,3 +224,18 @@ html, body {
 .player-list::-webkit-scrollbar { width: 4px; }
 .player-list::-webkit-scrollbar-track { background: transparent; }
 .player-list::-webkit-scrollbar-thumb { background: rgba(100, 120, 160, 0.3); border-radius: 2px; }
+
+/* Section divider inside the settings panel. The panel grew a whole mixer
+   block; without a break it reads as one undifferentiated wall of rows. */
+.settings-heading {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6b7590;
+  padding: 6px 0 2px;
+  margin-top: 4px;
+  border-top: 1px solid #2a3142;
+}
+.settings-heading:first-of-type {
+  margin-top: 2px;
+}

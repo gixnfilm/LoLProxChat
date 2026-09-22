@@ -2,11 +2,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { GameStateService, GameSession, TauriGameState } from './game-state';
 import { SignalingService, SignalMessage, PositionBroadcast } from './signaling';
-import { AudioService } from './audio';
+import { AudioService, PeerSide } from './audio';
 import { TrackingService, TrackingState } from './tracking';
 import { ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
-import { getAllyProximity } from './audio-prefs';
+import { getAllyProximity, getAudioPrefs, AudioPrefs } from './audio-prefs';
 import { PeerState } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
@@ -26,6 +26,8 @@ export class Orchestrator {
   private configPollId: number | null = null;
   private gameStatePollId: number | null = null;
   private positionTickRunning = false;
+  // Consecutive /compute-volumes failures, for throttling the error log.
+  private volumeFailures = 0;
   private sessionActive = false;
   private lastOverlayRepositionTime = 0;
   private lastOverlayBounds: { x: number; y: number; w: number; h: number } | null = null;
@@ -170,6 +172,10 @@ export class Orchestrator {
     // Carry over any mute toggles the user set before/between sessions.
     this.audio.setSelfMuted(this.selfMutedPref);
     this.audio.setMuteAll(this.muteAllPref);
+    // ...and the mixer. A new AudioService is built per game while the overlay
+    // window is never reloaded, so without this the engine silently resets to
+    // its defaults while the UI still shows the user's slider positions.
+    this.audio.applyAudioPrefs(getAudioPrefs());
 
     // Join signaling room. v0.3: team is sent so the server can do team-aware
     // proximity (allies always full volume; enemies fade out at vision range).
@@ -248,10 +254,10 @@ export class Orchestrator {
       // not from peer-to-peer data channels.
       this.volumeClient = new VolumeClient();
 
-      // Start volume computation tick (~10 Hz). GainNode setTargetAtTime
-      // smoothing on the peer connections turns the discrete steps into a
-      // continuous ramp; the tick rate just sets how often we refresh the
-      // *target*, not how often the audio gain actually moves.
+      // Start volume computation tick (10 Hz). Per-peer GainNode
+      // setTargetAtTime smoothing turns these discrete steps into a continuous
+      // ramp; the tick rate just sets how often we refresh the *target*, not
+      // how often the audio gain actually moves.
       this.volumeTickId = window.setInterval(() => this.positionTick(), 100) as unknown as number;
 
       // Poll game.cfg every 5 seconds for minimap scale changes
@@ -296,30 +302,30 @@ export class Orchestrator {
       .map(p => p.position);
     this.tracking.setPeerGamePositions(allyPeerPositions);
 
+    // The mixer needs sides to pick the Team vs Enemy gain; /compute-volumes
+    // only returns names.
+    this.audio.setPeerTeams(this.peerSides());
+
     // Before CV locks on (SCANNING), pass through all ally audio at full volume (fountain)
     if (this.tracking.getState() === TrackingState.SCANNING) {
-      const allyVolumes: Record<string, number> = {};
-      for (const [name, state] of this.peerStates) {
-        if (state.team === this.session.localPlayer.team) {
-          allyVolumes[name] = 1.0;
-        }
-      }
-      this.audio.applyPeerVolumes(allyVolumes);
+      this.applyFallbackVolumes();
       this.broadcastOverlayState();
       return;
     }
 
     const position = this.tracking.getLastPosition();
     if (!position || (position.x === 0 && position.y === 0)) {
+      this.applyFallbackVolumes();
       this.broadcastOverlayState();
       return;
     }
 
     // Stop reporting if our position is stale (CV has been extrapolating
     // for >2s). The server prunes positions older than STALE_POSITION_MS
-    // (60s) on its own, but we want to stop polluting earlier than that
+    // (5s) on its own, but we want to stop polluting earlier than that
     // when CV has clearly lost the player.
     if (this.tracking.getHoldDurationSec() > 2) {
+      this.applyFallbackVolumes();
       this.broadcastOverlayState();
       return;
     }
@@ -346,11 +352,59 @@ export class Orchestrator {
         getAllyProximity(),
       );
       this.audio.applyPeerVolumes(result.peerVolumes);
+      this.volumeFailures = 0;
     } catch (e) {
-      console.error('[LoLProxChat] Volume computation failed:', e);
+      // Don't just log and leave: skipping applyPeerVolumes means setVolume is
+      // never called, the EMA never steps, and every peer stays pinned at
+      // whatever gain it last had — indefinitely. One failed request (timeout,
+      // 429) used to freeze the whole mix.
+      this.volumeFailures++;
+      if (this.volumeFailures === 1 || this.volumeFailures % 50 === 0) {
+        console.error('[LoLProxChat] Volume computation failed (' +
+          this.volumeFailures + ' in a row):', e);
+      }
+      this.applyFallbackVolumes();
     }
 
     this.broadcastOverlayState();
+  }
+
+  /** summonerName → side, from the roster the orchestrator already tracks. */
+  private peerSides(): Map<string, PeerSide> {
+    const sides = new Map<string, PeerSide>();
+    const myTeam = this.session?.localPlayer.team;
+    for (const [name, state] of this.peerStates) {
+      sides.set(name, state.team === myTeam ? 'ally' : 'enemy');
+    }
+    return sides;
+  }
+
+  /**
+   * What to play when this tick has no usable position of our own — CV hasn't
+   * locked yet, lost the player, or the volume request failed.
+   *
+   * Teammates keep playing at full volume (scaled by the Team / Master gains);
+   * enemies are simply absent from the map we hand over, so
+   * resolveProximityTargets holds them for the grace window and then fades
+   * them out. That is the honest degradation: without our own coordinates
+   * there is no distance to compute, and enemy audio is the part that depends
+   * on it. The alternative behaviours are both worse — freezing leaves stale
+   * gains stuck forever, and silencing everyone cuts the team off over a
+   * routine CV hiccup.
+   *
+   * Note this overrides Ally-proximity while it is active. Nothing else is
+   * possible: proximity needs a position, and this path is exactly the case
+   * where we don't have one.
+   */
+  private applyFallbackVolumes(): void {
+    if (!this.audio || !this.session) return;
+    const allyVolumes: Record<string, number> = {};
+    for (const [name, state] of this.peerStates) {
+      if (state.team === this.session.localPlayer.team) {
+        allyVolumes[name] = 1.0;
+      }
+    }
+    this.audio.applyPeerVolumes(allyVolumes);
   }
 
   private async handlePeerPosition(peer: PositionBroadcast): Promise<void> {
@@ -514,6 +568,8 @@ export class Orchestrator {
     }, clamped);
   }
   setPTTState(held: boolean): void { this.audio?.setPTTState(held); }
+  /** Mixer settings changed in the overlay — persistence is the caller's job. */
+  updateAudioPrefs(prefs: AudioPrefs): void { this.audio?.applyAudioPrefs(prefs); }
   updateSettings(settings: any): void { this.audio?.updateSettings(settings); }
   applyInputDevice(id: string | null): Promise<void> | void { return this.audio?.applyInputDevice(id); }
   applyOutputDevice(id: string | null): Promise<void> | void { return this.audio?.applyOutputDevice(id); }

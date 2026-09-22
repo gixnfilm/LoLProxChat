@@ -2,6 +2,16 @@ import { PeerConnection } from './peer-connection';
 import { SignalingService, SignalMessage } from './signaling';
 import { AudioSettings } from '../core/types';
 import { getStoredInputDeviceId, getStoredOutputDeviceId } from './devices';
+import {
+  AudioPrefs, getAudioPrefs, getPlayerVolumes, setStoredPlayerVolume,
+  curveFor, groupGainFor,
+} from './audio-prefs';
+import { shapeProximity, computeFinalPeerVolume } from './proximity-curve';
+
+export { computeFinalPeerVolume };
+
+/** Which side of the scoreboard a peer is on, for the Team / Enemy gains. */
+export type PeerSide = 'ally' | 'enemy';
 
 function peakRms(buf: Float32Array): number {
   let sumSq = 0;
@@ -9,20 +19,6 @@ function peakRms(buf: Float32Array): number {
     sumSq += buf[i] * buf[i];
   }
   return Math.sqrt(sumSq / buf.length);
-}
-
-/**
- * Compute the per-peer audio gain by combining the server-returned proximity
- * volume with the user's per-player slider preference. Exported so the
- * slider-fix logic (issue #7) can be unit-tested without spinning up
- * AudioService + its PeerConnection / WebAudio dependencies.
- *
- * Both inputs are clamped to [0, 1] defensively. The output is their product.
- */
-export function computeFinalPeerVolume(proximityVol: number, sliderVol: number): number {
-  const p = Math.max(0, Math.min(1, proximityVol));
-  const s = Math.max(0, Math.min(1, sliderVol));
-  return p * s;
 }
 
 /**
@@ -110,8 +106,27 @@ export class AudioService {
     playerVolumes: {},
   };
 
+  // Mixer preferences (master / team / enemy gains, falloff curve, boost
+  // toggle). Read from localStorage at construction so a freshly built
+  // AudioService — one is created per game — starts where the user left off
+  // instead of silently reverting to defaults while the overlay still shows
+  // the old slider positions.
+  private prefs: AudioPrefs = getAudioPrefs();
+  // summonerName → side, pushed by the orchestrator each tick. Needed because
+  // /compute-volumes returns names only, but Team and Enemy have separate
+  // gains. Unknown names are treated as allies: the SCANNING passthrough only
+  // ever names teammates, and guessing "enemy" there would apply the (louder)
+  // enemy gain to someone we know nothing about.
+  private peerTeams: Map<string, PeerSide> = new Map();
+
   // Audio processing state
   private audioContext: AudioContext | null = null;
+  // Playback graph, deliberately on its own AudioContext: the mic chain lives
+  // on `audioContext` and is torn down / rebuilt on device switches, and a mic
+  // failure must not take everyone's voice down with it.
+  private playbackCtx: AudioContext | null = null;
+  private playbackBus: GainNode | null = null;
+  private playbackCompressor: DynamicsCompressorNode | null = null;
   private gainNode: GainNode | null = null;
   private outputStream: MediaStream | null = null;
   // Held so we can swap it when the user picks a different input device at
@@ -130,6 +145,93 @@ export class AudioService {
   constructor(signaling: SignalingService, localName: string) {
     this.signaling = signaling;
     this.localName = localName;
+    this.settings.playerVolumes = getPlayerVolumes();
+    this.settings.inputVolume = this.prefs.inputVolume;
+  }
+
+  /**
+   * Lazily build the shared playback bus:
+   *
+   *     peer gain ─┐
+   *     peer gain ─┼→ playbackBus → compressor → destination
+   *     peer gain ─┘
+   *
+   * The compressor is not cosmetic. Per-peer gain can now exceed 1.0, and
+   * several peers talking at once sum on this bus — without it, boosting
+   * clips. It also lifts quiet passages, which is half the reason distant
+   * enemies were hard to make out in the first place.
+   *
+   * Returns null when the boost path is disabled or unavailable, in which case
+   * peers fall back to element playback (capped at unity).
+   */
+  private ensurePlaybackGraph(): GainNode | null {
+    if (!this.prefs.audioBoost) return null;
+    if (this.playbackBus) return this.playbackBus;
+    try {
+      const ctx = new AudioContext();
+      const bus = ctx.createGain();
+      bus.gain.value = 1.0;
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -18;
+      comp.knee.value = 12;
+      comp.ratio.value = 4;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.25;
+      bus.connect(comp);
+      comp.connect(ctx.destination);
+      this.playbackCtx = ctx;
+      this.playbackBus = bus;
+      this.playbackCompressor = comp;
+      void this.resumePlaybackContext();
+      void this.applyPlaybackSink();
+      console.log('[Audio] Playback graph created (boost path active)');
+      return bus;
+    } catch (e) {
+      console.warn('[Audio] Playback graph unavailable — element playback only:', e);
+      this.playbackCtx = null;
+      this.playbackBus = null;
+      this.playbackCompressor = null;
+      return null;
+    }
+  }
+
+  private async resumePlaybackContext(): Promise<void> {
+    const ctx = this.playbackCtx;
+    if (!ctx || ctx.state !== 'suspended') return;
+    try {
+      await ctx.resume();
+    } catch (e) {
+      console.warn('[Audio] Playback context resume failed:', e);
+    }
+  }
+
+  /** Point the playback context at the user's chosen output device. */
+  private async applyPlaybackSink(): Promise<void> {
+    const ctx = this.playbackCtx as (AudioContext & { setSinkId?: (id: string) => Promise<void> }) | null;
+    const outputId = getStoredOutputDeviceId();
+    if (!ctx || !outputId || typeof ctx.setSinkId !== 'function') return;
+    try {
+      await ctx.setSinkId(outputId);
+      console.log('[Audio] Playback sink →', outputId);
+    } catch (e) {
+      console.warn('[Audio] Playback setSinkId failed:', e);
+    }
+  }
+
+  private teardownPlaybackGraph(): void {
+    for (const peer of this.peers.values()) peer.setPlaybackGraph(null, null);
+    try { this.playbackCompressor?.disconnect(); } catch { /* already gone */ }
+    try { this.playbackBus?.disconnect(); } catch { /* already gone */ }
+    void this.playbackCtx?.close().catch(() => { /* already closed */ });
+    this.playbackCtx = null;
+    this.playbackBus = null;
+    this.playbackCompressor = null;
+  }
+
+  /** Attach a peer to the boost path if it is enabled. */
+  private attachPlayback(peer: PeerConnection): void {
+    const bus = this.ensurePlaybackGraph();
+    if (bus && this.playbackCtx) peer.setPlaybackGraph(this.playbackCtx, bus);
   }
 
   async initMicrophone(): Promise<void> {
@@ -246,6 +348,7 @@ export class AudioService {
     try {
       peer = await PeerConnection.create(remoteName);
       void peer.setOutputDevice(getStoredOutputDeviceId());
+      this.attachPlayback(peer);
     } catch (e) {
       this.connectingPeers.delete(remoteName);
       throw e;
@@ -331,6 +434,7 @@ export class AudioService {
           console.log('[Audio] Peer created via incoming offer: ' + signal.from);
           peer = await PeerConnection.create(signal.from);
           void peer.setOutputDevice(getStoredOutputDeviceId());
+          this.attachPlayback(peer);
           this.peers.set(signal.from, peer);
           if (this.outputStream) peer.addLocalStream(this.outputStream);
 
@@ -374,6 +478,76 @@ export class AudioService {
       peer.close();
       this.peers.delete(remoteName);
     }
+    // Drop the per-peer proximity bookkeeping too. Leaving it behind let a
+    // reconnecting peer inherit a stale gain via setPlayerVolume before the
+    // first fresh /compute-volumes tick landed.
+    this.lastProximityVolumes.delete(remoteName);
+    this.lastSeenInResponseMs.delete(remoteName);
+    this.lastAppliedVolume.delete(remoteName);
+  }
+
+  /** Tell the mixer which side each peer is on (drives Team vs Enemy gain). */
+  setPeerTeams(teams: Map<string, PeerSide>): void {
+    this.peerTeams = teams;
+  }
+
+  /**
+   * The last proximity value the server returned per peer. The orchestrator
+   * replays this when a tick can't reach the server (CV lost the player, the
+   * request failed) so the grace-then-fade logic keeps running instead of
+   * leaving every peer frozen at its last gain.
+   */
+  getLastProximityVolumes(): Record<string, number> {
+    return Object.fromEntries(this.lastProximityVolumes);
+  }
+
+  /** Current mixer prefs (the overlay reads these back for its sliders). */
+  getAudioPrefs(): AudioPrefs {
+    return this.prefs;
+  }
+
+  /**
+   * Apply a new set of mixer prefs. Caller owns persistence; this only moves
+   * the running engine. Re-applies every peer's gain immediately so a slider
+   * drag is audible now rather than at the next 100 ms tick.
+   */
+  applyAudioPrefs(prefs: AudioPrefs): void {
+    const boostChanged = prefs.audioBoost !== this.prefs.audioBoost;
+    this.prefs = prefs;
+    this.settings.inputVolume = prefs.inputVolume;
+    this.applyInputVolume();
+
+    if (boostChanged) {
+      if (prefs.audioBoost) {
+        for (const peer of this.peers.values()) this.attachPlayback(peer);
+      } else {
+        this.teardownPlaybackGraph();
+      }
+      console.log('[Audio] Audio boost →', prefs.audioBoost ? 'ON (WebAudio)' : 'OFF (element)');
+    }
+    this.refreshPeerVolumes();
+  }
+
+  /** Recompute + apply every connected peer's gain from cached proximity. */
+  private refreshPeerVolumes(): void {
+    for (const [name, peer] of this.peers) {
+      const proximity = this.lastProximityVolumes.get(name) ?? 0;
+      peer.setVolume(this.finalVolumeFor(name, proximity), true);
+    }
+  }
+
+  /**
+   * Server proximity value → actual playback gain, for one peer.
+   * Re-shapes the server's quadratic falloff with the user's curve, then
+   * applies the per-player trim and the group / master gains.
+   */
+  private finalVolumeFor(name: string, proximityVol: number): number {
+    const isAlly = this.peerTeams.get(name) !== 'enemy';
+    const shaped = shapeProximity(proximityVol, curveFor(this.prefs, isAlly));
+    const trim = this.settings.playerVolumes[name] ?? 1.0;
+    return computeFinalPeerVolume(
+      shaped, trim, groupGainFor(this.prefs, isAlly), this.prefs.masterVolume,
+    );
   }
 
   applyPeerVolumes(volumes: Record<string, number>): void {
@@ -383,7 +557,12 @@ export class AudioService {
     // Debug is on (console.log is no-op'd by core/logging.ts). Throttled
     // to ≥1s OR when the summary string changes, so an active session
     // doesn't drown the log in ~10 lines/sec of identical snapshots.
-    const entries = Object.entries(volumes);
+    // Drop anything non-numeric before it reaches the maths. The response is
+    // parsed straight from JSON with no schema check upstream, and a single
+    // null / string entry used to throw here (.toFixed) and take the whole
+    // tick — every peer's gain with it.
+    const entries = Object.entries(volumes)
+      .filter(([, v]) => typeof v === 'number' && Number.isFinite(v));
     const summary = entries.length
       ? entries.map(([n, v]) => `${n}=${v.toFixed(2)}`).join(' ')
       : '(none)';
@@ -399,13 +578,14 @@ export class AudioService {
 
     // Mark every peer present in this response as freshly seen, so the grace
     // window below only holds peers that genuinely just dropped out.
-    for (const name of Object.keys(volumes)) this.lastSeenInResponseMs.set(name, now);
+    const clean: Record<string, number> = Object.fromEntries(entries);
+    for (const name of Object.keys(clean)) this.lastSeenInResponseMs.set(name, now);
 
     // Process the union of response peers AND connected peers. Connected peers
     // absent from `volumes` are silenced (0) — but a peer seen within the last
     // PROXIMITY_GRACE_MS holds its last volume first, so a single dropped coords
     // packet on a lossy tunnel doesn't blip the audio to silence and back (#27).
-    const targets = resolveProximityTargets(volumes, this.peers.keys(), {
+    const targets = resolveProximityTargets(clean, this.peers.keys(), {
       lastVolumes: this.lastProximityVolumes,
       lastSeenMs: this.lastSeenInResponseMs,
       now,
@@ -422,8 +602,7 @@ export class AudioService {
 
       const peer = this.peers.get(name);
       if (!peer) continue;
-      const playerVolume = this.settings.playerVolumes[name] ?? 1.0;
-      const finalVol = computeFinalPeerVolume(volume, playerVolume);
+      const finalVol = this.finalVolumeFor(name, volume);
       const wasState = this.lastAppliedVolume.get(name);
       // Always update volume so it's correct when unmuted. Don't hard-mute on
       // finalVol === 0 — the smoothed gain ramp handles it without a click,
@@ -492,15 +671,18 @@ export class AudioService {
   }
 
   setPlayerVolume(name: string, volume: number): void {
+    if (!Number.isFinite(volume)) return;
     this.settings.playerVolumes[name] = Math.max(0, Math.min(1, volume));
+    setStoredPlayerVolume(name, this.settings.playerVolumes[name]);
     const peer = this.peers.get(name);
     if (peer) {
       // Use the last server-returned proximity volume — NOT a hardcoded 1.0.
       // The old hardcoded path briefly played the peer at slider-value × 1.0
       // before the next 100 ms position tick zeroed it out (issue #7
       // "moved the slider and started hearing them" symptom).
+      // `immediate` keeps the drag out of the proximity EMA (see setVolume).
       const proximityVol = this.lastProximityVolumes.get(name) ?? 0;
-      peer.setVolume(computeFinalPeerVolume(proximityVol, this.settings.playerVolumes[name]));
+      peer.setVolume(this.finalVolumeFor(name, proximityVol), true);
     }
   }
 
@@ -523,9 +705,22 @@ export class AudioService {
   }
 
   private applyInputVolume(): void {
-    if (this.gainNode) {
-      this.gainNode.gain.value = this.settings.inputVolume;
+    if (!this.gainNode) return;
+    // updateSettings takes `any` all the way from the overlay bus, and an
+    // empty slider field parses to NaN. Assigning NaN to an AudioParam throws
+    // and kills the whole mic chain, so clamp before it gets there. The short
+    // ramp replaces a raw `.value =` write, which zipper-noised on drag.
+    const raw = this.settings.inputVolume;
+    const v = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 1;
+    this.settings.inputVolume = v;
+    const ctx = this.audioContext;
+    if (ctx) {
+      try {
+        this.gainNode.gain.setTargetAtTime(v, ctx.currentTime, 0.02);
+        return;
+      } catch { /* fall through to a direct write */ }
     }
+    this.gainNode.gain.value = v;
   }
 
   private async acquireMicStream(): Promise<MediaStream> {
@@ -545,8 +740,10 @@ export class AudioService {
   private async applyStoredOutputDevice(): Promise<void> {
     const outputId = getStoredOutputDeviceId();
     if (!outputId) return;
-    // Playback is element-only, so the output device is applied per peer via
-    // HTMLMediaElement.setSinkId (more widely supported than AudioContext.setSinkId).
+    // Two sinks to move: the playback context (boost path) and each peer's
+    // element (fallback path). Setting both keeps the device correct
+    // regardless of which path is live, and costs nothing when one is idle.
+    await this.applyPlaybackSink();
     for (const peer of this.peers.values()) {
       await peer.setOutputDevice(outputId);
     }
@@ -576,10 +773,6 @@ export class AudioService {
   }
 
   async applyOutputDevice(_id: string | null): Promise<void> {
-    if (!this.audioContext) {
-      console.log('[Audio] applyOutputDevice: not initialized yet, will pick up on next session');
-      return;
-    }
     await this.applyStoredOutputDevice();
   }
 
@@ -594,5 +787,6 @@ export class AudioService {
     this.localStream = null;
     this.audioContext?.close();
     this.audioContext = null;
+    this.teardownPlaybackGraph();
   }
 }

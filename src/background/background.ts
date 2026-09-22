@@ -41,6 +41,11 @@ window.addEventListener('overlayAction', ((event: CustomEvent) => {
     case 'updateSettings':
       orchestrator.updateSettings(payload);
       break;
+    case 'updateAudioPrefs':
+      // Already persisted by the overlay (setAudioPrefs); this only moves the
+      // running mixer so a drag is audible immediately.
+      orchestrator.updateAudioPrefs(payload);
+      break;
     case 'setPttKey':
       invoke('set_ptt_key', { vk: payload.vk })
         .catch((e) => console.warn('[Background] set_ptt_key failed:', e));

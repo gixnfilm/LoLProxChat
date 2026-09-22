@@ -15,7 +15,10 @@ import {
   probeMicPermission,
 } from '../services/devices';
 import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
-import { getAllyProximity, setAllyProximity } from '../services/audio-prefs';
+import {
+  AudioPrefs, getAudioPrefs, setAudioPrefs, getPlayerVolumes,
+} from '../services/audio-prefs';
+import { ProximityMode } from '../services/proximity-curve';
 import { computeDesiredHeight } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
 import '../core/window-globals';
@@ -80,7 +83,11 @@ let debugEnabled = false;
 setLoggingEnabled(false);
 
 // Per-player volume cache (so sliders don't reset on re-render)
-const playerVolumes: Map<string, number> = new Map();
+// Seeded from localStorage so the row sliders show the trims the user actually
+// set. AudioService loads the same store, so UI and engine agree from the first
+// frame — previously both reset to 100% on a new game while the UI kept
+// displaying the old positions.
+const playerVolumes: Map<string, number> = new Map(Object.entries(getPlayerVolumes()));
 
 // Tauri handles window dragging and resizing via its window config.
 // The drag handle uses Tauri's built-in data-tauri-drag-region attribute
@@ -247,20 +254,83 @@ btnForceTurn.addEventListener('click', () => {
   syncForceTurnButton();
 });
 
-// Ally-proximity toggle (#22). When ON, teammates fade with distance (the same
-// falloff as enemies) instead of always playing at full volume. The orchestrator
-// reads this fresh on each /compute-volumes tick, so flipping it takes effect on
-// the next position update — no reconnect needed.
-const btnAllyProximity = document.getElementById('btn-ally-proximity') as HTMLButtonElement;
-function syncAllyProximityButton(): void {
-  const on = getAllyProximity();
-  btnAllyProximity.textContent = on ? 'ON' : 'OFF';
-  btnAllyProximity.classList.toggle('active', on);
+// Voice mixer. Everything here is persisted in localStorage by audio-prefs and
+// pushed into the running AudioService, which also re-reads it when a new game
+// starts a fresh service — so a slider position survives both a game change and
+// an app restart.
+//
+// Proximity (#22) replaces the old binary ally toggle with three states,
+// because "teammates fade too" and "nothing fades at all" are both things
+// people want and the boolean could only express one of them. The orchestrator
+// reads the mode fresh on every /compute-volumes tick, so changes apply on the
+// next position update with no reconnect.
+const PROXIMITY_ORDER: ProximityMode[] = ['off', 'enemy', 'all'];
+
+function pushPrefs(patch: Partial<AudioPrefs>): AudioPrefs {
+  const next = setAudioPrefs(patch);
+  sendToBackground('updateAudioPrefs', next);
+  return next;
 }
-queueMicrotask(syncAllyProximityButton);
-btnAllyProximity.addEventListener('click', () => {
-  setAllyProximity(!getAllyProximity());
-  syncAllyProximityButton();
+
+const btnProximityMode = document.getElementById('btn-proximity-mode') as HTMLButtonElement;
+function syncProximityButton(mode: ProximityMode): void {
+  btnProximityMode.textContent = mode.toUpperCase();
+  btnProximityMode.classList.toggle('active', mode !== 'off');
+}
+btnProximityMode.addEventListener('click', () => {
+  const current = getAudioPrefs().proximityMode;
+  const next = PROXIMITY_ORDER[(PROXIMITY_ORDER.indexOf(current) + 1) % PROXIMITY_ORDER.length];
+  syncProximityButton(pushPrefs({ proximityMode: next }).proximityMode);
+});
+
+const btnAudioBoost = document.getElementById('btn-audio-boost') as HTMLButtonElement;
+function syncAudioBoostButton(on: boolean): void {
+  btnAudioBoost.textContent = on ? 'ON' : 'OFF';
+  btnAudioBoost.classList.toggle('active', on);
+}
+btnAudioBoost.addEventListener('click', () => {
+  syncAudioBoostButton(pushPrefs({ audioBoost: !getAudioPrefs().audioBoost }).audioBoost);
+});
+
+/**
+ * Wire one mixer slider. `scale` converts the integer slider position to the
+ * stored value (percentages → gain factors, etc). The label always shows the
+ * raw slider number so it matches what the user is dragging.
+ */
+function bindMixerSlider(
+  inputId: string,
+  labelId: string,
+  key: keyof AudioPrefs,
+  scale: (raw: number) => number,
+  toRaw: (value: number) => number,
+): void {
+  const input = document.getElementById(inputId) as HTMLInputElement;
+  const label = document.getElementById(labelId)!;
+  const sync = (prefs: AudioPrefs) => {
+    const raw = Math.round(toRaw(prefs[key] as number));
+    input.value = String(raw);
+    label.textContent = String(raw);
+  };
+  queueMicrotask(() => sync(getAudioPrefs()));
+  input.addEventListener('input', () => {
+    const raw = Number(input.value);
+    if (!Number.isFinite(raw)) return;
+    label.textContent = String(Math.round(raw));
+    pushPrefs({ [key]: scale(raw) } as Partial<AudioPrefs>);
+  });
+}
+
+bindMixerSlider('input-master-vol', 'master-vol-label', 'masterVolume', r => r / 100, v => v * 100);
+bindMixerSlider('input-team-vol', 'team-vol-label', 'teamVolume', r => r / 100, v => v * 100);
+bindMixerSlider('input-enemy-vol', 'enemy-vol-label', 'enemyVolume', r => r / 100, v => v * 100);
+bindMixerSlider('input-floor', 'floor-label', 'floor', r => r / 100, v => v * 100);
+bindMixerSlider('input-near-range', 'near-range-label', 'nearRange', r => r, v => v);
+bindMixerSlider('input-fade-curve', 'fade-curve-label', 'fadeCurve', r => r / 100, v => v * 100);
+
+queueMicrotask(() => {
+  const prefs = getAudioPrefs();
+  syncProximityButton(prefs.proximityMode);
+  syncAudioBoostButton(prefs.audioBoost);
 });
 
 // v0.3 (#1): PTT + toggle-mute key rebind. The Rust WH_KEYBOARD_LL hook
@@ -391,9 +461,18 @@ document.getElementById('input-mode')!.addEventListener('change', (e) => {
 
 const volumeInput = document.getElementById('input-volume') as HTMLInputElement;
 const volumeLabel = document.getElementById('volume-label')!;
+queueMicrotask(() => {
+  const stored = Math.round(getAudioPrefs().inputVolume * 100);
+  volumeInput.value = String(stored);
+  volumeLabel.textContent = String(stored);
+});
 volumeInput.addEventListener('input', () => {
-  const raw = parseInt(volumeInput.value);
-  volumeLabel.textContent = String(raw);
+  // Number(), not parseInt(): an empty field parses to NaN, which used to
+  // travel all the way to an AudioParam assignment and throw, killing the mic.
+  const raw = Number(volumeInput.value);
+  if (!Number.isFinite(raw)) return;
+  volumeLabel.textContent = String(Math.round(raw));
+  pushPrefs({ inputVolume: raw / 100 });
   sendToBackground('updateSettings', { inputVolume: raw / 100 });
 });
 
@@ -471,7 +550,9 @@ function createPlayerRow(peer: NearbyPeer, localTeam: 'ORDER' | 'CHAOS' | null |
   volSlider.addEventListener('mousedown', () => { activeSliderPlayer = peer.summonerName; });
   volSlider.addEventListener('mouseup', () => { activeSliderPlayer = null; });
   volSlider.addEventListener('input', () => {
-    const vol = parseInt(volSlider.value) / 100;
+    const raw = Number(volSlider.value);
+    if (!Number.isFinite(raw)) return;
+    const vol = raw / 100;
     playerVolumes.set(peer.summonerName, vol);
     sendToBackground('setPlayerVolume', { name: peer.summonerName, volume: vol });
   });
