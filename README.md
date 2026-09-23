@@ -1,8 +1,23 @@
 # LoLProxChat
 
 ![Server status](https://img.shields.io/website?url=https%3A%2F%2Fproxchat.dant123.com%2Fhealth&label=server&up_message=online&down_message=offline)
-[![Latest release](https://img.shields.io/github/v/release/danthi123/LoLProxChat)](https://github.com/danthi123/LoLProxChat/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/gixnfilm/LoLProxChat)](https://github.com/gixnfilm/LoLProxChat/releases/latest)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue)](LICENSE)
+
+> **Fork with a working volume mixer.** Upstream played peer voice through
+> `HTMLAudioElement.volume`, which browsers hard-cap at 1.0 — so proximity could
+> only ever make people *quieter*, nothing could be boosted, and there was no
+> master or group volume control at all. That is why distant enemies were
+> effectively inaudible ([upstream #21](https://github.com/danthi123/LoLProxChat/issues/21)).
+>
+> This fork moves playback to WebAudio (per-peer gain → shared bus → compressor),
+> adds a **Voice Mixer** in Settings — Master / Team / Enemy volume, a
+> three-state Proximity control, and an adjustable falloff curve with an audible
+> floor at max range — and fixes the volume pipeline freezing whenever minimap
+> tracking hiccuped. See the [changelog](CHANGELOG.md#v060--2026-09-22).
+>
+> All changes are client-side; it still uses the upstream signaling server.
+> Upstream: [danthi123/LoLProxChat](https://github.com/danthi123/LoLProxChat).
 
 **Proximity voice chat for League of Legends.** Hear nearby players (allies *and* enemies) with volume that scales by in-game distance — enemy voices fade in around champion-vision range and grow louder as they close.
 

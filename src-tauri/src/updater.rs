@@ -1,18 +1,18 @@
 use serde::Serialize;
 
 const GITHUB_LATEST: &str =
-    "https://api.github.com/repos/danthi123/LoLProxChat/releases/latest";
+    "https://api.github.com/repos/gixnfilm/LoLProxChat/releases/latest";
 const UA: &str = "proxchat-updater";
 
 // Allowed URL prefix for the update download. The release-asset URL GitHub's
 // API returns is always of the form
-//   https://github.com/danthi123/LoLProxChat/releases/download/<tag>/<asset>
+//   https://github.com/gixnfilm/LoLProxChat/releases/download/<tag>/<asset>
 // Restricting download_and_apply_update to this prefix means a compromised
 // frontend can't redirect the auto-updater to an attacker-controlled binary.
 // Self-hosters who fork the repo and adjust GITHUB_LATEST above should update
 // this prefix to match their fork.
 const ALLOWED_DOWNLOAD_PREFIX: &str =
-    "https://github.com/danthi123/LoLProxChat/releases/download/";
+    "https://github.com/gixnfilm/LoLProxChat/releases/download/";
 
 #[derive(Serialize, Clone)]
 pub struct UpdateInfo {
