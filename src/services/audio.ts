@@ -231,13 +231,13 @@ export class AudioService {
     this.gainNode.gain.value = this.settings.inputVolume;
     const destination = this.audioContext.createMediaStreamDestination();
 
-    // Simple straight-through chain: mic → gain → destination. Noise
-    // suppression is handled by the browser's native DSP (set via the
-    // getUserMedia constraints above) which runs off the JS main thread.
-    // mic → volume → gate → WebRTC. The gate is a separate node rather than a
-    // second writer on the volume gain: two things multiplying into one
-    // AudioParam means whichever wrote last wins, and a slider drag would
-    // cancel an in-flight gate ramp (or vice versa).
+    // mic → volume → gate → WebRTC. Noise suppression is handled by the
+    // browser's native DSP (set via the getUserMedia constraints above) which
+    // runs off the JS main thread.
+    //
+    // The gate is a separate node rather than a second writer on the volume
+    // gain: two things multiplying into one AudioParam means whichever wrote
+    // last wins, so a slider drag would cancel an in-flight gate ramp.
     this.gateNode = this.audioContext.createGain();
     this.gateNode.gain.value = 1;
     this.micSource.connect(this.gainNode);
@@ -290,8 +290,16 @@ export class AudioService {
       const micPeak = peakRms(micBuf);
       const outPeak = peakRms(outBuf);
       const transmitting = !this.selfMuted && this.isTransmitting();
+      // The gate is in here because "nobody can hear me" and "my threshold
+      // is above my voice" look identical from the outside. With this line the
+      // log file answers it: a level that never reaches the threshold is the
+      // whole diagnosis.
       console.log(
         '[Audio] mic=' + micPeak.toFixed(3) +
+        ' level=' + levelPercent(micPeak).toFixed(0) +
+        ' gate=' + (this.prefs.micThreshold > 0
+          ? (this.gate.open ? 'open' : 'shut') + '@' + this.prefs.micThreshold
+          : 'off') +
         ' out=' + outPeak.toFixed(3) +
         ' transmit=' + transmitting +
         ' inputMode=' + this.settings.inputMode +
@@ -326,8 +334,7 @@ export class AudioService {
       // One boolean, decided here. Letting the overlay combine mute + PTT +
       // gate itself would be a second copy of the rule, and a meter that says
       // "you are being heard" while you are muted is worse than no meter.
-      const transmitting = !this.selfMuted && this.isTransmitting() &&
-        (!gated || this.gate.open);
+      const transmitting = this.isTransmitting() && (!gated || this.gate.open);
       window.dispatchEvent(new CustomEvent('micLevel', {
         detail: { level, transmitting },
       }));
