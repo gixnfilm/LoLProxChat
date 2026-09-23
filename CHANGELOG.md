@@ -4,6 +4,30 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.7.1] — 2026-09-23
+
+### Fixed
+- **Buttons below roughly the middle of the settings panel stopped responding**
+  — Debug, Debug Logs and everything under them. The overlay is click-through
+  outside a rectangle it reports to the Windows side, and that rectangle was
+  being described by two separate observers from two different measurements;
+  whichever reported last won. When the one measuring the panel ran before the
+  layout had settled it reported a height that was too short, and every control
+  below that line quietly became click-through.
+
+  It was invisible in v0.6.x only because the overlay was re-sending its
+  geometry 40 times a second, so the next frame always corrected it. Damping
+  that loop in v0.7.0 removed the accidental self-healing and exposed the real
+  bug. Both numbers now come from one measurement, plus a twice-a-second
+  reconciliation for layouts that settle late.
+
+### Changed
+- **Teammates beyond hearing range are now silent**, like enemies, instead of
+  holding at 25%. The floor existed to stop you losing your team on a map where
+  the audible radius is about one lane segment — but in play it just sounded
+  like teammates were audible everywhere, which defeats the point.
+
+
 ## [v0.7.0] — 2026-09-23
 
 Reliability release, plus directional audio.
@@ -546,6 +570,7 @@ falloff is configurable instead of fixed.
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.7.1]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.1
 [v0.7.0]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.0
 [v0.6.1]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.6.1
 [v0.6.0]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.6.0

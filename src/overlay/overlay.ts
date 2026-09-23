@@ -33,6 +33,24 @@ let resizeQueued = false;
 // resize -> relayout -> ResizeObserver -> resize loop dead. See
 // RESIZE_DEAD_BAND_PX for the measurement that motivated this.
 let lastSentHeight: number | null = null;
+let lastSentHitRect: { width: number; height: number } | null = null;
+
+/**
+ * Push the panel's geometry to Rust: the window size, and the rectangle inside
+ * which clicks are ours rather than passing through to the game.
+ *
+ * Both numbers come from the same measurement on purpose. They used to be
+ * produced by two separate ResizeObservers — one reporting
+ * `computeDesiredHeight(scrollHeight)`, the other `panel.offsetHeight` — and
+ * whichever fired last won, because both write the same field on the Rust
+ * side. If the hit-rect observer measured before the layout settled it wrote a
+ * height that was too small, and everything below that line became
+ * click-through: the Debug and Debug Logs rows stopped responding entirely.
+ *
+ * That race was invisible while the resize loop was firing 40 times a second,
+ * because the next frame immediately corrected it. Damping the loop removed
+ * the accidental self-healing and exposed the underlying bug.
+ */
 function syncOverlayHeight(): void {
   if (resizeQueued) return;
   resizeQueued = true;
@@ -49,11 +67,33 @@ function syncOverlayHeight(): void {
     const dpr = window.devicePixelRatio || 1;
     const desired = computeDesiredHeight(Math.ceil(panel.scrollHeight));
     const height = Math.round(desired * dpr);
+    const width = Math.round(panel.offsetWidth * dpr);
+
+    // The hit-rect is sent whenever it changes at all — it is a cheap message
+    // and getting it wrong makes controls unusable, so it does not share the
+    // resize dead band.
+    if (!lastSentHitRect || lastSentHitRect.width !== width || lastSentHitRect.height !== height) {
+      lastSentHitRect = { width, height };
+      sendToBackground('panelResize', { width, height });
+    }
+
     if (!shouldResendHeight(height, lastSentHeight)) return;
     lastSentHeight = height;
     sendToBackground('resizeOverlay', { height });
   });
 }
+
+/**
+ * Low-frequency reconciliation.
+ *
+ * ResizeObserver only fires when the element's own box changes, so a layout
+ * that settles late — a web font, the debug thumbnail loading, a scrollbar
+ * appearing — can leave the last reported geometry stale with nothing to
+ * correct it. Two checks a second is invisible next to the 40/second this
+ * replaces, and it restores the self-healing without the cost. Each check is a
+ * measurement and a comparison; nothing is sent unless something moved.
+ */
+setInterval(syncOverlayHeight, 500);
 
 interface NearbyPeer {
   summonerName: string;
@@ -580,20 +620,10 @@ function sendToBackground(action: string, payload: any): void {
   window.dispatchEvent(new CustomEvent('overlayAction', { detail: { action, payload } }));
 }
 
-// Report the panel's current size to Rust so the click-through hit-test
-// follows collapse/expand/settings open. Multiply by devicePixelRatio
-// because offsetWidth/Height are CSS pixels but the Rust side compares
-// against physical-pixel cursor coords from GetCursorPos.
-const reportPanelSize = () => {
-  const dpr = window.devicePixelRatio || 1;
-  sendToBackground('panelResize', {
-    width: Math.round(panel.offsetWidth * dpr),
-    height: Math.round(panel.offsetHeight * dpr),
-  });
-};
-new ResizeObserver(reportPanelSize).observe(panel);
-// Initial report once the layout has settled
-requestAnimationFrame(reportPanelSize);
+// The click-through rect is reported by syncOverlayHeight, from the same
+// measurement that sizes the window — see the note there for why having two
+// independent reporters was a bug rather than redundancy.
+requestAnimationFrame(syncOverlayHeight);
 
 // --- Track active player row DOM elements for in-place updates ---
 const playerRows: Map<string, {

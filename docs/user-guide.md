@@ -71,11 +71,11 @@ Two things follow from that, and both are intentional:
 
 Both need **Audio Boost** on (Settings → Other), which is the default.
 
-> **Teammates get an exception; enemies don't.** Once a teammate leaves that
-> radius they hold at **Min Vol (far)** rather than going silent — you can
-> always still reach your team, just quietly. Enemies out of range are silent,
-> full stop: the server withholds them so that no client can hear them, and
-> the app will not invent a level for someone it wasn't told about.
+> **Out of range means silent, for teammates and enemies alike.** Nobody
+> further than ~1350 units is audible. For enemies that is enforced by the
+> server, which simply does not tell your client they exist; for teammates it
+> is a deliberate choice, because anything else ends up sounding like everyone
+> is audible everywhere.
 >
 > The exact numbers above were measured against the live server
 > (`node scripts/probe-server-curve.mjs`), not read out of the source — the
@@ -125,7 +125,6 @@ The log is plain text. It contains your summoner name and nearby players' summon
 | Faint or no audio from a nearby enemy | Raise **Settings → Enemy Vol** (up to 300%). Enemy voices fade with distance by design. |
 | Everyone suddenly sounds doubled / echoey | Turn **Settings → Audio Boost** OFF. That reverts to the original playback path (capped at 100%) and is worth reporting. |
 | Teammates don't get quieter when they walk away | **Settings → Proximity** must be **ALL**. On **ENEMY** (or **OFF**) teammates stay at full volume. If it is already ALL, turn on Debug and check the log: `[Audio] applyPeerVolumes` prints what the server actually returned per teammate. |
-| Teammates are quiet but never silent | Working as intended — beyond ~1350 units they hold at a low level so you never lose your team entirely. |
 | Voices all sound centred | You can only hear direction for players whose icon is visible on your minimap, and only when it's clear which icon is which. Check **Stereo** isn't at 0 and **Audio Boost** is on. |
 | The panel says FINDING YOU | Tracking has lost your champion on the minimap. Proximity and stereo both need your own position, so enemies stay silent until it clears. It recovers on its own; if it persists, make sure League is in **Borderless** and the minimap isn't covered. |
 | Something else seems off | Make sure you're on the latest version: turn on **Auto-update**, or grab the newest build from [Releases](https://github.com/danthi123/LoLProxChat/releases/latest). |

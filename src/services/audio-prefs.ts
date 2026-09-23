@@ -29,9 +29,13 @@ export interface AudioPrefs {
    *  behaviour); all = teammates fade with distance too (sends allyProximity
    *  to the server, which applies the same falloff to same-team peers). */
   proximityMode: ProximityMode;
-  /** Volume at and beyond the edge of hearing range, 0..1. Above 0 keeps
-   *  teammates audible once they leave the server's (small) radius instead of
-   *  vanishing — see resolvePeerLevel. Does NOT apply to enemies. */
+  /** Volume at and beyond the edge of hearing range, 0..1.
+   *
+   *  0 means a teammate who leaves the hearing radius goes silent, exactly
+   *  like an enemy. It was 0.25 in v0.7.0 on the reasoning that the radius is
+   *  small enough to lose your team otherwise — but in play that read as
+   *  "teammates are audible everywhere", which is the opposite of the point of
+   *  proximity chat. Silence is the honest reading of "too far away". */
   floor: number;
   /** How far into the server's fade band to stay at full volume, 0..0.9.
    *  A fraction, not game units: the server's actual distances are its own
@@ -57,7 +61,7 @@ export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
   teamVolume: 1.0,
   enemyVolume: 1.6,
   proximityMode: 'all' as ProximityMode,
-  floor: 0.25,
+  floor: 0,
   nearFraction: 0,
   fadeCurve: 0.7,
   audioBoost: true,
