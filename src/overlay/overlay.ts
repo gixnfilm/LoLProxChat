@@ -324,7 +324,7 @@ bindMixerSlider('input-master-vol', 'master-vol-label', 'masterVolume', r => r /
 bindMixerSlider('input-team-vol', 'team-vol-label', 'teamVolume', r => r / 100, v => v * 100);
 bindMixerSlider('input-enemy-vol', 'enemy-vol-label', 'enemyVolume', r => r / 100, v => v * 100);
 bindMixerSlider('input-floor', 'floor-label', 'floor', r => r / 100, v => v * 100);
-bindMixerSlider('input-near-range', 'near-range-label', 'nearRange', r => r, v => v);
+bindMixerSlider('input-near-range', 'near-range-label', 'nearFraction', r => r / 100, v => v * 100);
 bindMixerSlider('input-fade-curve', 'fade-curve-label', 'fadeCurve', r => r / 100, v => v * 100);
 
 queueMicrotask(() => {

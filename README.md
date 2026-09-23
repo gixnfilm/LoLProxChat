@@ -12,9 +12,12 @@
 >
 > This fork moves playback to WebAudio (per-peer gain → shared bus → compressor),
 > adds a **Voice Mixer** in Settings — Master / Team / Enemy volume, a
-> three-state Proximity control, and an adjustable falloff curve with an audible
-> floor at max range — and fixes the volume pipeline freezing whenever minimap
-> tracking hiccuped. See the [changelog](CHANGELOG.md#v060--2026-09-22).
+> three-state Proximity control, and an adjustable falloff curve — and fixes the
+> volume pipeline freezing whenever minimap tracking hiccuped. Teammates fade
+> with distance and stay reachable at a configurable floor once they leave the
+> server's (fairly small) hearing radius; enemies out of range stay silent,
+> because that boundary is the server's to enforce.
+> See the [changelog](CHANGELOG.md#v061--2026-09-23).
 >
 > All changes are client-side; it still uses the upstream signaling server.
 > Upstream: [danthi123/LoLProxChat](https://github.com/danthi123/LoLProxChat).

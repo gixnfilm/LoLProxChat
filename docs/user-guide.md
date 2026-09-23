@@ -45,15 +45,25 @@ How loud everyone else is for you. All of it persists across games and restarts.
 | **Team Vol** | Extra gain for teammates, 0-200%. |
 | **Enemy Vol** | Extra gain for enemies, 0-300%. Defaults to **160%** — enemies always arrive attenuated by distance, so they need more headroom than allies to be comfortably audible. |
 | **Proximity** | **OFF** — nobody fades, everyone you can hear plays flat. **ENEMY** — only enemies fade with distance. **ALL** — teammates fade too. Takes effect on the next position update; no reconnect. |
-| **Min Vol (far)** | How loud someone still is at the very edge of hearing range, 0-100%. The stock curve drops to ~7% at 1300 units, which is inaudible in practice — 25% keeps distant players present without drowning close ones. |
-| **Fade Start** | Distance in game units that still plays at full volume before the fade begins. 300 is roughly short-trade range. |
-| **Fade Curve** | Shape of the fade. Below 100 fades gently (people stay loud further out); above 100 fades steeply, so only close range is loud. |
+| **Min Vol (far)** | How loud a **teammate** stays once they leave the server's hearing radius, 0-100%. This is the most important slider here: the radius is only ~1350 game units on a 14870-unit map — roughly a lane segment — so a teammate is out of range for most of a game. 0 = they go silent out there. Does **not** apply to enemies (see the note below). |
+| **Fade Start** | How much of the fade band stays at full volume, in percent. The server already plays anyone closer than ~900 units at full volume; this only narrows the remaining 900→1350 stretch. 0 = follow the server exactly. |
+| **Fade Curve** | Shape of the fade between ~900 and ~1350 units. Below 100 fades gently (people stay loud further out); above 100 fades steeply. |
 | **Audio Boost** | The WebAudio playback path. **Required for any volume above 100%** — turning it off reverts to the original playback, which the browser caps at 100%. Only switch it off if you hear echo or doubled voices. |
 
 > **Hearing range is set by the server and can't be raised here.** Players
 > further than ~1350 units (a champion's vision range) are not sent to you at
 > all, so no slider can bring them back. Everything inside that radius is
 > yours to shape.
+>
+> **Teammates get an exception; enemies don't.** Once a teammate leaves that
+> radius they hold at **Min Vol (far)** rather than going silent — you can
+> always still reach your team, just quietly. Enemies out of range are silent,
+> full stop: the server withholds them so that no client can hear them, and
+> the app will not invent a level for someone it wasn't told about.
+>
+> The exact numbers above were measured against the live server
+> (`node scripts/probe-server-curve.mjs`), not read out of the source — the
+> two disagreed, which is what broke teammate proximity in v0.6.0.
 | **Hide IP (Force TURN)** | Routes all voice through the TURN relay so peers in your match never see your public IP. Defends against DDoS / port-scan attempts from random players. Adds ~20-100 ms latency. Default off; takes effect on the next peer connection. See [`threat-model.md`](threat-model.md) for the full discussion. |
 | **Debug** | Toggles diagnostic mode — shows a filtered minimap thumbnail with the tracked position marked, exposes the Scan Rate slider, and starts writing a debug log to disk. Off by default; turn on only when investigating a problem or asked by a maintainer. |
 | **Debug Logs → OPEN** | Launches Explorer at `%LOCALAPPDATA%\com.proxchat.app\` so you can grab `lolproxchat.log` to attach to a GitHub issue. |
@@ -96,7 +106,8 @@ The log is plain text. It contains your summoner name and nearby players' summon
 | Can't hear one specific player | Check their per-player volume slider isn't at zero and their **MUTE** isn't on. |
 | Faint or no audio from a nearby enemy | Raise **Settings → Enemy Vol** (up to 300%) and **Min Vol (far)**. Enemy voices fade with distance by design; those two sliders decide how much. |
 | Everyone suddenly sounds doubled / echoey | Turn **Settings → Audio Boost** OFF. That reverts to the original playback path (capped at 100%) and is worth reporting. |
-| Teammates don't get quieter when they walk away | **Settings → Proximity** must be **ALL**. On **ENEMY** (or **OFF**) teammates stay at full volume. |
+| Teammates don't get quieter when they walk away | **Settings → Proximity** must be **ALL**. On **ENEMY** (or **OFF**) teammates stay at full volume. If it is already ALL, turn on Debug and check the log: `[Audio] applyPeerVolumes` prints what the server actually returned per teammate. |
+| Teammates are quiet but never silent | Working as intended — they hold at **Min Vol (far)** beyond ~1350 units. Set that slider to 0 if you want them to disappear entirely. |
 | Something else seems off | Make sure you're on the latest version: turn on **Auto-update**, or grab the newest build from [Releases](https://github.com/danthi123/LoLProxChat/releases/latest). |
 
 ## Updating

@@ -6,7 +6,7 @@ import {
   AudioPrefs, getAudioPrefs, getPlayerVolumes, setStoredPlayerVolume,
   curveFor, groupGainFor,
 } from './audio-prefs';
-import { shapeProximity, computeFinalPeerVolume } from './proximity-curve';
+import { resolvePeerLevel, computeFinalPeerVolume, TickSample } from './proximity-curve';
 
 export { computeFinalPeerVolume };
 
@@ -21,60 +21,28 @@ function peakRms(buf: Float32Array): number {
   return Math.sqrt(sumSq / buf.length);
 }
 
-/**
- * Resolve a target proximity volume for every peer that needs one: the union
- * of peers present in the server response and currently-connected peers.
- *
- * Connected peers that are ABSENT from the response are silenced (0). The
- * v0.3 server omits peers it filtered out (cross-team beyond the hearing cap,
- * or stale position) from the response entirely, so a missing entry means
- * "not audible" — NOT "leave unchanged". Without this, a peer once heard
- * within range stays stuck at its last gain forever after moving out of
- * range (the "enemy hears me no matter where on the map" bug: the server
- * correctly drops them, the client failed to act on the absence). In v0.2
- * the server always included far peers at volume 0, so the client never had
- * to handle absence.
- *
- * `grace` (optional) softens that absence: if a peer was in the response very
- * recently (within `graceMs`), HOLD its last volume instead of dropping to 0.
- * A single dropped coords packet — common on lossy / DPI-bypass tunnels (#27)
- * — briefly removes a peer from the response; without the grace that blips the
- * audio to silence and straight back, which reads as the volume "flapping".
- * After the window elapses the peer falls to 0 and the caller's EMA fades it.
- *
- * Exported for unit testing without AudioService's WebAudio dependencies.
- */
-export function resolveProximityTargets(
-  responseVolumes: Record<string, number>,
-  connectedPeerNames: Iterable<string>,
-  grace?: {
-    lastVolumes: Map<string, number>;
-    lastSeenMs: Map<string, number>;
-    now: number;
-    graceMs: number;
-  },
-): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const [name, v] of Object.entries(responseVolumes)) out.set(name, v);
-  for (const name of connectedPeerNames) {
-    if (out.has(name)) continue;
-    if (grace) {
-      const seen = grace.lastSeenMs.get(name);
-      if (seen !== undefined && grace.now - seen <= grace.graceMs) {
-        out.set(name, grace.lastVolumes.get(name) ?? 0);
-        continue;
-      }
-    }
-    out.set(name, 0);
-  }
-  return out;
-}
-
-// How long to keep a peer at its last proximity volume after it drops out of
-// the server response before fading to 0. Covers a dropped coords packet or two
-// on a lossy / DPI-bypass connection so the audio doesn't blip to silence and
-// back (#27).
+// How long to keep a peer at its last level after it drops out of the server
+// response before letting it fall away. Covers a dropped coords packet or two
+// on a lossy / DPI-bypass connection so the audio doesn't blip and back (#27).
 const PROXIMITY_GRACE_MS = 1500;
+
+// How long a teammate keeps their last level on ticks that never reached the
+// server at all (our own tracking lost us). Longer than the grace window on
+// purpose: here the missing information is OUR position, not theirs, so their
+// last known level stays the best estimate for a while. Every death puts the
+// local client into this state, and ducking the whole team on every death is
+// worse than holding a slightly stale level.
+const ALLY_NO_DATA_HOLD_MS = 5000;
+
+/** Per-peer volume bookkeeping. One entry, so the inputs can't drift apart. */
+interface PeerVolumeState {
+  /** Last value the SERVER actually returned (never a synthesised one). */
+  lastServerVol?: number;
+  /** Last shaped level applied, 0..1. Used to hold through a gap. */
+  lastLevel?: number;
+  /** performance.now() when the peer was last present in a server response. */
+  seenAtMs?: number;
+}
 
 export class AudioService {
   private localStream: MediaStream | null = null;
@@ -86,13 +54,14 @@ export class AudioService {
   private mutedPlayers: Set<string> = new Set();
   // Track last reported volume state per peer so we only log transitions
   private lastAppliedVolume: Map<string, string> = new Map();
-  // Last proximity volume the server returned for each peer. Used by
-  // setPlayerVolume so the slider applies on top of real distance, not a
-  // hardcoded 1.0. Updated on every applyPeerVolumes tick.
-  private lastProximityVolumes: Map<string, number> = new Map();
-  // performance.now() of the last tick each peer appeared in the server
-  // response — drives the proximity grace window (see PROXIMITY_GRACE_MS, #27).
-  private lastSeenInResponseMs: Map<string, number> = new Map();
+  // Everything the level decision needs, per peer. Kept as one record rather
+  // than parallel maps so a code path can't update half of it — the previous
+  // split let a synthesised value be recorded as if the server had sent it.
+  private peerVolumeState: Map<string, PeerVolumeState> = new Map();
+  // Consecutive fresh responses in which every teammate came back at exactly
+  // 1.00 — the fingerprint of a server that ignores allyProximity.
+  private allyFlatOneTicks = 0;
+  private allyProximityWarned = false;
   // Throttling state for the verbose applyPeerVolumes snapshot log
   private lastVolumeLogLine = '';
   private lastVolumeLogMs = 0;
@@ -481,24 +450,13 @@ export class AudioService {
     // Drop the per-peer proximity bookkeeping too. Leaving it behind let a
     // reconnecting peer inherit a stale gain via setPlayerVolume before the
     // first fresh /compute-volumes tick landed.
-    this.lastProximityVolumes.delete(remoteName);
-    this.lastSeenInResponseMs.delete(remoteName);
+    this.peerVolumeState.delete(remoteName);
     this.lastAppliedVolume.delete(remoteName);
   }
 
   /** Tell the mixer which side each peer is on (drives Team vs Enemy gain). */
   setPeerTeams(teams: Map<string, PeerSide>): void {
     this.peerTeams = teams;
-  }
-
-  /**
-   * The last proximity value the server returned per peer. The orchestrator
-   * replays this when a tick can't reach the server (CV lost the player, the
-   * request failed) so the grace-then-fade logic keeps running instead of
-   * leaving every peer frozen at its last gain.
-   */
-  getLastProximityVolumes(): Record<string, number> {
-    return Object.fromEntries(this.lastProximityVolumes);
   }
 
   /** Current mixer prefs (the overlay reads these back for its sliders). */
@@ -528,99 +486,180 @@ export class AudioService {
     this.refreshPeerVolumes();
   }
 
-  /** Recompute + apply every connected peer's gain from cached proximity. */
+  /**
+   * Re-apply every connected peer's gain after a prefs change, by re-running
+   * the same decision on the cached inputs.
+   *
+   * Deliberately replays the stored inputs rather than a stored output: a
+   * gain/curve change has to re-shape from the raw server value, and a peer
+   * that has no server value yet must not be silently treated as "proximity 0"
+   * — that would duck every teammate to silence on a slider drag while
+   * tracking is still scanning.
+   */
   private refreshPeerVolumes(): void {
-    for (const [name, peer] of this.peers) {
-      const proximity = this.lastProximityVolumes.get(name) ?? 0;
-      peer.setVolume(this.finalVolumeFor(name, proximity), true);
+    const now = performance.now();
+    for (const name of this.peers.keys()) {
+      this.applyLevelFor(name, { kind: 'no-data' }, now, true);
     }
   }
 
-  /**
-   * Server proximity value → actual playback gain, for one peer.
-   * Re-shapes the server's quadratic falloff with the user's curve, then
-   * applies the per-player trim and the group / master gains.
-   */
-  private finalVolumeFor(name: string, proximityVol: number): number {
-    const isAlly = this.peerTeams.get(name) !== 'enemy';
-    const shaped = shapeProximity(proximityVol, curveFor(this.prefs, isAlly));
+  private isAlly(name: string): boolean {
+    return this.peerTeams.get(name) !== 'enemy';
+  }
+
+  /** Shaped level (0..1) → actual playback gain, for one peer. */
+  private finalFromShaped(name: string, shaped: number, isAlly: boolean): number {
     const trim = this.settings.playerVolumes[name] ?? 1.0;
     return computeFinalPeerVolume(
       shaped, trim, groupGainFor(this.prefs, isAlly), this.prefs.masterVolume,
     );
   }
 
-  applyPeerVolumes(volumes: Record<string, number>): void {
-    // Verbose snapshot of every server-returned per-peer volume. Lets us
-    // distinguish "server said 0 / we played 0" from "server said 0.8 /
-    // EMA stuck near 1" when debugging volume bugs. Already silent unless
-    // Debug is on (console.log is no-op'd by core/logging.ts). Throttled
-    // to ≥1s OR when the summary string changes, so an active session
-    // doesn't drown the log in ~10 lines/sec of identical snapshots.
-    // Drop anything non-numeric before it reaches the maths. The response is
-    // parsed straight from JSON with no schema check upstream, and a single
-    // null / string entry used to throw here (.toFixed) and take the whole
-    // tick — every peer's gain with it.
-    const entries = Object.entries(volumes)
-      .filter(([, v]) => typeof v === 'number' && Number.isFinite(v));
-    const summary = entries.length
-      ? entries.map(([n, v]) => `${n}=${v.toFixed(2)}`).join(' ')
-      : '(none)';
-    const skipped = entries.filter(([n]) => !this.peers.has(n)).map(([n]) => n);
-    const skippedTag = skipped.length ? `(skipped no-peer: ${skipped.join(',')})` : '';
-    const fullLine = summary + (skippedTag ? ' ' + skippedTag : '');
+  /**
+   * Decide and apply one peer's level for this tick, and record what was
+   * applied. Returns the final gain (for logging).
+   */
+  private applyLevelFor(
+    name: string, tick: TickSample, now: number, immediate = false,
+  ): number {
+    const st = this.peerVolumeState.get(name);
+    const isAlly = this.isAlly(name);
+    const shaped = resolvePeerLevel({
+      tick,
+      isAlly,
+      curve: curveFor(this.prefs, isAlly),
+      lastLevel: st?.lastLevel,
+      msSinceSeen: st?.seenAtMs === undefined ? undefined : now - st.seenAtMs,
+      graceMs: PROXIMITY_GRACE_MS,
+      allyHoldMs: ALLY_NO_DATA_HOLD_MS,
+    });
+    const next: PeerVolumeState = { ...(st ?? {}), lastLevel: shaped };
+    this.peerVolumeState.set(name, next);
+
+    const finalVol = this.finalFromShaped(name, shaped, isAlly);
+    this.peers.get(name)?.setVolume(finalVol, immediate);
+    return finalVol;
+  }
+
+  /**
+   * Apply one tick's worth of peer levels.
+   *
+   * `volumes === null` means this tick never reached the server — our own
+   * position is unknown (tracking scanning / holding / lost) or the request
+   * failed. That is a genuinely different situation from "the server answered
+   * and this peer wasn't in it", and conflating the two is what pinned
+   * teammates at full volume: the fallback path used to synthesise 1.0 for
+   * every ally and feed it in here, where it was indistinguishable from a real
+   * response — so it refreshed the grace window and was cached as if the
+   * server had said it, then held forever by the next fallback tick.
+   *
+   * On a null tick nothing is stamped and nothing is cached as server data.
+   */
+  applyPeerVolumes(volumes: Record<string, number> | null): void {
     const now = performance.now();
-    if (fullLine !== this.lastVolumeLogLine || now - this.lastVolumeLogMs >= 1000) {
-      console.log('[Audio] applyPeerVolumes:', fullLine);
-      this.lastVolumeLogLine = fullLine;
-      this.lastVolumeLogMs = now;
+    const fresh = volumes !== null;
+
+    // Drop anything non-numeric before it reaches the maths. The response is
+    // parsed from JSON, and a single null / string entry used to throw here
+    // (.toFixed) and take the whole tick — every peer's gain with it.
+    const entries = fresh
+      ? Object.entries(volumes).filter(([, v]) => typeof v === 'number' && Number.isFinite(v))
+      : [];
+    const clean: Record<string, number> = Object.fromEntries(entries);
+
+    if (fresh) {
+      // Only a real response updates "when did we last hear about this peer"
+      // and the raw server value. Both feed the grace window and the prefs
+      // replay, and both must reflect the server, not us.
+      for (const [name, vol] of entries) {
+        const st = this.peerVolumeState.get(name) ?? {};
+        st.lastServerVol = vol;
+        st.seenAtMs = now;
+        this.peerVolumeState.set(name, st);
+      }
+      this.noteAllyProximityHealth(entries);
     }
 
-    // Mark every peer present in this response as freshly seen, so the grace
-    // window below only holds peers that genuinely just dropped out.
-    const clean: Record<string, number> = Object.fromEntries(entries);
-    for (const name of Object.keys(clean)) this.lastSeenInResponseMs.set(name, now);
+    this.logVolumeSnapshot(fresh, entries, now);
 
-    // Process the union of response peers AND connected peers. Connected peers
-    // absent from `volumes` are silenced (0) — but a peer seen within the last
-    // PROXIMITY_GRACE_MS holds its last volume first, so a single dropped coords
-    // packet on a lossy tunnel doesn't blip the audio to silence and back (#27).
-    const targets = resolveProximityTargets(clean, this.peers.keys(), {
-      lastVolumes: this.lastProximityVolumes,
-      lastSeenMs: this.lastSeenInResponseMs,
-      now,
-      graceMs: PROXIMITY_GRACE_MS,
-    });
-    for (const [name, volume] of targets) {
-      // Remember the proximity volume per peer so setPlayerVolume (the
-      // per-row slider in the UI) can recompute finalVol correctly without
-      // waiting for the next position tick. Was using a hardcoded 1.0 which
-      // briefly played peers at full volume regardless of real distance —
-      // caused user-reported "moved the slider and started hearing them"
-      // blip on issue #7.
-      this.lastProximityVolumes.set(name, volume);
+    // Every connected peer gets a decision every tick — including the ones
+    // absent from the response, which is how a peer that walked out of range
+    // is silenced instead of sticking at its last gain.
+    for (const name of this.peers.keys()) {
+      const tick: TickSample = !fresh
+        ? { kind: 'no-data' }
+        : Object.prototype.hasOwnProperty.call(clean, name)
+          ? { kind: 'server', vol: clean[name] }
+          : { kind: 'absent' };
 
-      const peer = this.peers.get(name);
-      if (!peer) continue;
-      const finalVol = this.finalVolumeFor(name, volume);
       const wasState = this.lastAppliedVolume.get(name);
-      // Always update volume so it's correct when unmuted. Don't hard-mute on
-      // finalVol === 0 — the smoothed gain ramp handles it without a click,
-      // and it lets brief proximity zeros (CV tracking glitches) fade gracefully.
-      peer.setVolume(finalVol);
+      // Don't hard-mute on 0 — the smoothed gain ramp handles it without a
+      // click and lets brief proximity zeros fade gracefully.
+      const finalVol = this.applyLevelFor(name, tick, now);
+
+      const peer = this.peers.get(name)!;
       const muteNow = this.muteAll || this.mutedPlayers.has(name);
-      if (muteNow) {
-        peer.mute();
-      } else {
-        peer.unmute();
-      }
-      // Log audible/silent transitions (skip steady-state to keep noise down)
+      if (muteNow) peer.mute();
+      else peer.unmute();
+
       const stateNow = muteNow ? 'silent' : finalVol.toFixed(2);
       if (wasState !== stateNow) {
         console.log('[Audio] peer ' + name + ' → ' + stateNow +
           (wasState !== undefined ? ' (was ' + wasState + ')' : ''));
         this.lastAppliedVolume.set(name, stateNow);
       }
+    }
+  }
+
+  /**
+   * Verbose snapshot of the tick. Silent unless Debug is on (console.log is
+   * no-op'd by core/logging.ts) and throttled to ≥1 s or a change, so an
+   * active session doesn't drown the log at 10 lines/sec.
+   *
+   * Carries the proximity mode and whether the tick reached the server at all,
+   * because "teammates are always loud" has three different causes and this
+   * line is what tells them apart.
+   */
+  private logVolumeSnapshot(fresh: boolean, entries: [string, number][], now: number): void {
+    const summary = entries.length
+      ? entries.map(([n, v]) => `${n}=${v.toFixed(2)}`).join(' ')
+      : '(none)';
+    const skipped = entries.filter(([n]) => !this.peers.has(n)).map(([n]) => n);
+    const skippedTag = skipped.length ? ` (skipped no-peer: ${skipped.join(',')})` : '';
+    const source = fresh ? 'server' : 'NO-SERVER-DATA';
+    const fullLine = `[${source} mode=${this.prefs.proximityMode}] ${summary}${skippedTag}`;
+    if (fullLine !== this.lastVolumeLogLine || now - this.lastVolumeLogMs >= 1000) {
+      console.log('[Audio] applyPeerVolumes:', fullLine);
+      this.lastVolumeLogLine = fullLine;
+      this.lastVolumeLogMs = now;
+    }
+  }
+
+  /**
+   * Warn once if the server looks like it is ignoring `allyProximity`.
+   *
+   * Fingerprint: in ALL mode an honouring server subjects teammates to the
+   * same range and staleness rules as everyone else, so they must *sometimes*
+   * be absent or below 1.0. A teammate that is present in every single
+   * response at exactly 1.0 for a long stretch means the flag isn't being
+   * honoured — which is unfixable client-side (a 1.0 carries no distance), so
+   * it deserves to be said out loud rather than looking like a client bug.
+   */
+  private noteAllyProximityHealth(entries: [string, number][]): void {
+    if (this.allyProximityWarned || this.prefs.proximityMode !== 'all') return;
+    const allies = entries.filter(([name]) => this.isAlly(name));
+    if (!allies.length) return;
+    if (allies.every(([, v]) => v === 1)) {
+      this.allyFlatOneTicks++;
+      // ~30 s at the 10 Hz position tick.
+      if (this.allyFlatOneTicks >= 300) {
+        this.allyProximityWarned = true;
+        console.warn('[Audio] Ally proximity looks unsupported by the server: ' +
+          'every teammate has been present at exactly 1.00 for ~30s while ' +
+          'Proximity=ALL. The client cannot derive distance from 1.0.');
+      }
+    } else {
+      this.allyFlatOneTicks = 0;
     }
   }
 
@@ -674,15 +713,14 @@ export class AudioService {
     if (!Number.isFinite(volume)) return;
     this.settings.playerVolumes[name] = Math.max(0, Math.min(1, volume));
     setStoredPlayerVolume(name, this.settings.playerVolumes[name]);
-    const peer = this.peers.get(name);
-    if (peer) {
-      // Use the last server-returned proximity volume — NOT a hardcoded 1.0.
-      // The old hardcoded path briefly played the peer at slider-value × 1.0
-      // before the next 100 ms position tick zeroed it out (issue #7
-      // "moved the slider and started hearing them" symptom).
-      // `immediate` keeps the drag out of the proximity EMA (see setVolume).
-      const proximityVol = this.lastProximityVolumes.get(name) ?? 0;
-      peer.setVolume(this.finalVolumeFor(name, proximityVol), true);
+    if (this.peers.has(name)) {
+      // Re-run the normal decision on the cached inputs rather than assuming
+      // anything about proximity. A hardcoded 1.0 here briefly played the peer
+      // at slider-value × full volume before the next tick corrected it
+      // (issue #7); a hardcoded 0 would duck a teammate to silence whenever no
+      // server value has arrived yet. `immediate` keeps the drag out of the
+      // proximity EMA (see PeerConnection.setVolume).
+      this.applyLevelFor(name, { kind: 'no-data' }, performance.now(), true);
     }
   }
 

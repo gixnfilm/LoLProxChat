@@ -11,7 +11,7 @@
 //     overlay window is not reloaded. Without persistence the UI kept showing
 //     the old slider positions while the fresh engine ran at its defaults.
 
-import { ProximityMode, ProximityCurve, SERVER_MAX_RANGE } from './proximity-curve';
+import { ProximityMode, ProximityCurve } from './proximity-curve';
 
 const PREFS_KEY = 'lolproxchat.audioPrefs';
 const PLAYER_VOLUMES_KEY = 'lolproxchat.playerVolumes';
@@ -29,11 +29,15 @@ export interface AudioPrefs {
    *  behaviour); all = teammates fade with distance too (sends allyProximity
    *  to the server, which applies the same falloff to same-team peers). */
   proximityMode: ProximityMode;
-  /** Volume at the edge of hearing range, 0..1. Above 0 keeps distant peers
-   *  audible instead of letting them vanish into the server curve's cliff. */
+  /** Volume at and beyond the edge of hearing range, 0..1. Above 0 keeps
+   *  teammates audible once they leave the server's (small) radius instead of
+   *  vanishing — see resolvePeerLevel. Does NOT apply to enemies. */
   floor: number;
-  /** Game units of full-volume plateau before the fade starts. */
-  nearRange: number;
+  /** How far into the server's fade band to stay at full volume, 0..0.9.
+   *  A fraction, not game units: the server's actual distances are its own
+   *  business and have already changed once under us. 0 = follow the server's
+   *  own plateau exactly. */
+  nearFraction: number;
   /** Falloff exponent. <1 fades gently, >1 fades steeply. */
   fadeCurve: number;
   /** WebAudio playback path (required for any gain above 1.0). Turning it off
@@ -50,7 +54,7 @@ export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
   enemyVolume: 1.6,
   proximityMode: 'all' as ProximityMode,
   floor: 0.25,
-  nearRange: 300,
+  nearFraction: 0,
   fadeCurve: 0.7,
   audioBoost: true,
   inputVolume: 1.0,
@@ -96,7 +100,11 @@ export function getAudioPrefs(): AudioPrefs {
     enemyVolume: num(stored.enemyVolume, DEFAULT_AUDIO_PREFS.enemyVolume, 0, 3),
     proximityMode,
     floor: num(stored.floor, DEFAULT_AUDIO_PREFS.floor, 0, 1),
-    nearRange: num(stored.nearRange, DEFAULT_AUDIO_PREFS.nearRange, 0, SERVER_MAX_RANGE - 1),
+    // Note: a stored `nearRange` from v0.6.0 is deliberately NOT migrated. It
+    // was in game units against an inverse-curve constant that turned out not
+    // to match the live server, so the number is meaningless now; the default
+    // is the honest starting point.
+    nearFraction: num(stored.nearFraction, DEFAULT_AUDIO_PREFS.nearFraction, 0, 0.9),
     fadeCurve: num(stored.fadeCurve, DEFAULT_AUDIO_PREFS.fadeCurve, 0.3, 2),
     audioBoost: typeof stored.audioBoost === 'boolean'
       ? stored.audioBoost
@@ -129,8 +137,7 @@ export function curveFor(prefs: AudioPrefs, isAlly: boolean): ProximityCurve | n
   if (prefs.proximityMode === 'off') return null;
   if (prefs.proximityMode === 'enemy' && isAlly) return null;
   return {
-    nearRange: prefs.nearRange,
-    farRange: SERVER_MAX_RANGE,
+    nearFraction: prefs.nearFraction,
     floor: prefs.floor,
     gamma: prefs.fadeCurve,
   };

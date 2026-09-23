@@ -22,7 +22,6 @@ import {
   getPlayerVolumes,
   setStoredPlayerVolume,
 } from '../../src/services/audio-prefs';
-import { SERVER_MAX_RANGE } from '../../src/services/proximity-curve';
 
 const PREFS_KEY = 'lolproxchat.audioPrefs';
 
@@ -61,7 +60,7 @@ describe('getAudioPrefs', () => {
       teamVolume: -5,
       enemyVolume: 'loud',
       floor: 4,
-      nearRange: 99999,
+      nearFraction: 99,
       fadeCurve: 0,
       inputVolume: 7,
     }));
@@ -70,7 +69,7 @@ describe('getAudioPrefs', () => {
     expect(p.teamVolume).toBe(0);
     expect(p.enemyVolume).toBe(DEFAULT_AUDIO_PREFS.enemyVolume);
     expect(p.floor).toBe(1);
-    expect(p.nearRange).toBe(SERVER_MAX_RANGE - 1);
+    expect(p.nearFraction).toBe(0.9);
     expect(p.fadeCurve).toBe(0.3);
     expect(p.inputVolume).toBe(1);
     for (const v of Object.values(p)) {
@@ -130,9 +129,16 @@ describe('curveFor / groupGainFor', () => {
   });
 
   test('the curve carries the user prefs through', () => {
-    const p = { ...DEFAULT_AUDIO_PREFS, floor: 0.4, nearRange: 500, fadeCurve: 1.3 };
+    const p = { ...DEFAULT_AUDIO_PREFS, floor: 0.4, nearFraction: 0.3, fadeCurve: 1.3 };
     const c = curveFor(p, false)!;
-    expect(c).toEqual({ nearRange: 500, farRange: SERVER_MAX_RANGE, floor: 0.4, gamma: 1.3 });
+    expect(c).toEqual({ nearFraction: 0.3, floor: 0.4, gamma: 1.3 });
+  });
+
+  test('a v0.6.0 nearRange in storage is ignored, not misread as a fraction', () => {
+    // It was game units against an inverse-curve constant that turned out not
+    // to match the live server, so the stored number is meaningless now.
+    storage.setItem(PREFS_KEY, JSON.stringify({ nearRange: 300 }));
+    expect(getAudioPrefs().nearFraction).toBe(DEFAULT_AUDIO_PREFS.nearFraction);
   });
 
   test('group gain picks the right slider per side', () => {

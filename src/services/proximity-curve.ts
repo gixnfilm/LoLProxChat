@@ -2,28 +2,36 @@
  * Client-side re-shaping of the server's proximity volume.
  *
  * The signaling server stays authoritative for *who* you may hear (the team
- * filter and the hard cut-off at vision range). It hands back one number per
- * audible peer, produced by `server/src/volumes.ts::calculateVolume`:
+ * filter and the hard cut-off at vision range) and hands back one number per
+ * audible peer. What that number means was measured against the live server on
+ * 2026-09-23 (`scripts/probe-server-curve.mjs`, re-runnable):
  *
- *     v = 1 - (d / 1350)²          for 0 <= d < 1350
+ *     d <  900        -> 1.0                        (full-volume plateau)
+ *     900 <= d < 1350 -> 1 - ((d - 900) / 450)²     (quadratic fade)
+ *     d >= 1350       -> omitted from the response entirely
  *
- * That curve is strictly monotonic on the audible interval, so it inverts:
+ * Two things about that are worth stating plainly, because the previous
+ * version of this file assumed otherwise and got both wrong:
  *
- *     d = 1350 · √(1 - v)
+ * 1. **The constants are not ours and they drift.** The bundled server source
+ *    says `1 - (d/1350)²` with no plateau — the deployed server disagrees. So
+ *    nothing here inverts to absolute game units any more. Everything works in
+ *    `u = √(1 - v)`, the normalised position inside whatever fade band the
+ *    server happens to use: `u = 0` at the near edge, `u = 1` at the cut-off.
+ *    That quantity is correct for any curve of the form `1 - (progress)²`,
+ *    whatever its endpoints, so a server-side retune cannot silently skew the
+ *    client's idea of distance the way the hardcoded 1350 did.
  *
- * Recovering `d` lets the client apply its own falloff — a full-volume plateau
- * near the player, adjustable steepness, and an audible floor at the edge —
- * without touching the server. The shipped curve is very flat up close and
- * cliff-like at the edge (0.75 at 675u, 0.073 at 1300u), which is why distant
- * enemies were effectively inaudible.
+ * 2. **The audible radius is tiny.** 1350 units on a 14870-unit map is roughly
+ *    a lane segment. Peers are *usually* out of range and therefore simply
+ *    absent from the response — which is why "absent" must not be conflated
+ *    with "silent" for teammates. See `resolvePeerLevel`.
  *
- * What this CANNOT do: hear anyone past 1350 units. The server omits those
- * peers from the response entirely rather than sending them at volume 0, so
- * there is nothing to re-shape. Range can be narrowed here, never widened.
+ * What the client genuinely controls: the shape inside the fade band, the
+ * level teammates keep once they leave it, and the group/master gains. What it
+ * cannot do is manufacture resolution the server didn't send — a returned
+ * 1.0 carries no distance information at all.
  */
-
-/** Must track `MAX_HEARING_RANGE` in server/src/volumes.ts. */
-export const SERVER_MAX_RANGE = 1350;
 
 /**
  * Ceiling on the total gain any single peer can reach. Playback runs through a
@@ -33,18 +41,38 @@ export const SERVER_MAX_RANGE = 1350;
  */
 export const MAX_TOTAL_GAIN = 4;
 
+/**
+ * The measured cut-off, in game units. Used only to describe the settings to
+ * the user — no maths depends on it, by design (see the header).
+ */
+export const MEASURED_CUTOFF_UNITS = 1350;
+/** The measured near edge of the fade band, in game units. Display only. */
+export const MEASURED_FADE_START_UNITS = 900;
+
 export type ProximityMode = 'off' | 'enemy' | 'all';
 
 export interface ProximityCurve {
-  /** Game units of full-volume plateau around the listener. */
-  nearRange: number;
-  /** Game units at which `floor` is reached. Clamped to SERVER_MAX_RANGE. */
-  farRange: number;
-  /** Volume at and beyond `farRange`, 0..1. The "still audible at the edge" knob. */
+  /**
+   * How far into the server's fade band to stay at full volume, 0..0.9.
+   * 0 means "start fading as soon as the server does". The server already
+   * provides its own near-field plateau, so this only narrows the band
+   * further; it cannot widen it.
+   */
+  nearFraction: number;
+  /** Level at (and beyond) the far edge of the band, 0..1. */
   floor: number;
   /** Falloff exponent. <1 fades gently (loud further out), >1 fades steeply. */
   gamma: number;
 }
+
+/** One tick's worth of information about one peer. */
+export type TickSample =
+  /** The server returned a volume for this peer. */
+  | { kind: 'server'; vol: number }
+  /** The server answered, but this peer was not in the response. */
+  | { kind: 'absent' }
+  /** This tick never reached the server (no own position, or request failed). */
+  | { kind: 'no-data' };
 
 function clamp(v: number, lo: number, hi: number): number {
   if (!Number.isFinite(v)) return lo;
@@ -52,12 +80,12 @@ function clamp(v: number, lo: number, hi: number): number {
 }
 
 /**
- * Invert the server's quadratic falloff to recover the distance it used.
- * Returns game units in [0, SERVER_MAX_RANGE].
+ * Normalised position inside the server's fade band: 0 at the near edge (full
+ * volume), 1 at the cut-off. Derived from `v = 1 - progress²`, so it holds for
+ * any endpoints the server chooses.
  */
-export function volumeToDistance(serverVol: number): number {
-  const v = clamp(serverVol, 0, 1);
-  return SERVER_MAX_RANGE * Math.sqrt(1 - v);
+export function fadePosition(serverVol: number): number {
+  return Math.sqrt(1 - clamp(serverVol, 0, 1));
 }
 
 /**
@@ -66,39 +94,115 @@ export function volumeToDistance(serverVol: number): number {
  * `curve === null` disables distance falloff: anything audible plays flat at
  * full volume (the server's range filter still applies — we can't undo that).
  *
- * Two values are passed through untouched, and both are load-bearing:
- *   • `serverVol <= 0` means "absent / silenced". The server never returns a
- *     genuine 0 for an audible peer (0 only happens at d >= 1350, and those
- *     peers are dropped from the response), and `resolveProximityTargets`
- *     synthesises 0 for connected-but-absent peers. Feeding that through the
- *     curve would inflate it to `floor` and make silenced peers audible.
- *   • `serverVol >= 1` is either "on top of you" or a full-volume ally, which
- *     is already the maximum the curve can produce.
+ * Two values pass through untouched, and both are load-bearing:
+ *   • `serverVol <= 0` means silence. Feeding it through the curve would lift
+ *     it to `floor`.
+ *   • `serverVol >= 1` means the peer is inside the server's own plateau. It
+ *     carries no distance information, so there is nothing to shape.
  */
 export function shapeProximity(serverVol: number, curve: ProximityCurve | null): number {
   if (!Number.isFinite(serverVol) || serverVol <= 0) return 0;
   if (serverVol >= 1) return 1;
   if (!curve) return 1;
 
-  const d = volumeToDistance(serverVol);
-  const near = clamp(curve.nearRange, 0, SERVER_MAX_RANGE);
-  if (d <= near) return 1;
+  const u = fadePosition(serverVol);
+  const near = clamp(curve.nearFraction, 0, 0.9);
+  if (u <= near) return 1;
 
-  const far = clamp(curve.farRange, near + 1, SERVER_MAX_RANGE);
   const floor = clamp(curve.floor, 0, 1);
   const gamma = clamp(curve.gamma, 0.05, 8);
-
-  const t = Math.min(1, (d - near) / (far - near));
+  const t = Math.min(1, (u - near) / (1 - near));
   return floor + (1 - floor) * Math.pow(1 - t, gamma);
 }
 
 /**
- * Combine the shaped proximity volume with the per-player trim slider and the
+ * The level a teammate keeps once they leave the server's hearing radius.
+ *
+ * This exists because the radius is small relative to the map (see the header):
+ * a teammate is out of range far more often than in it, so "absent" is the
+ * normal state, not an error. Silencing on absence would mean losing your team
+ * for most of the game — strictly worse than the bug it replaced. `floor` is
+ * also continuous with the curve, which asymptotes to exactly this value at the
+ * cut-off, so crossing the boundary makes no audible step.
+ *
+ * Set Min Vol (far) to 0 to get hard silence instead.
+ *
+ * With falloff disabled for this peer (`curve === null`, i.e. Proximity OFF or
+ * ENEMY) teammates are meant to be unconditionally audible, so it is 1.0.
+ */
+function allyOutOfRangeLevel(curve: ProximityCurve | null): number {
+  return curve ? clamp(curve.floor, 0, 1) : 1;
+}
+
+export interface PeerLevelInput {
+  tick: TickSample;
+  isAlly: boolean;
+  /** Falloff curve for this peer, or null when falloff is off for them. */
+  curve: ProximityCurve | null;
+  /** Last level actually applied, for hold-through-a-gap. */
+  lastLevel: number | undefined;
+  /** ms since this peer was last present in a server response. */
+  msSinceSeen: number | undefined;
+  /** How long to hold the last level when a peer drops out of a response. */
+  graceMs: number;
+  /** How long to hold when the tick itself had no server data (allies only). */
+  allyHoldMs: number;
+}
+
+/**
+ * Decide one peer's shaped level (0..1, before trim and group gain).
+ *
+ * The asymmetry between allies and enemies here is deliberate and is the whole
+ * point of the function:
+ *
+ * **Enemies are never synthesised.** Present → shaped; absent → hold briefly,
+ * then 0. The server omits out-of-range enemies precisely so that no client
+ * can hear them (it is the anti-cheat boundary), so inventing a level for an
+ * absent enemy — on a lost-tracking tick, say — would hand every user a
+ * hearing-range bypass. There is no mode in which that is acceptable.
+ *
+ * **Allies may be synthesised**, because for them absence is ordinary (out of
+ * a 1350-unit radius on a 14870-unit map) rather than a privacy boundary:
+ * allies see each other on the minimap regardless.
+ */
+export function resolvePeerLevel(input: PeerLevelInput): number {
+  const { tick, isAlly, curve, lastLevel, msSinceSeen, graceMs, allyHoldMs } = input;
+
+  if (tick.kind === 'server') {
+    return shapeProximity(tick.vol, curve);
+  }
+
+  const withinGrace = msSinceSeen !== undefined && msSinceSeen <= graceMs;
+
+  if (tick.kind === 'absent') {
+    // A single dropped coords packet on a lossy link briefly removes a peer
+    // from the response; holding across that keeps the audio from blipping to
+    // silence and straight back (#27).
+    if (withinGrace && lastLevel !== undefined) return lastLevel;
+    return isAlly ? allyOutOfRangeLevel(curve) : 0;
+  }
+
+  // kind === 'no-data': we have no position of our own this tick, so there is
+  // no distance for anyone. For an enemy that means exactly what absence means.
+  if (!isAlly) {
+    if (withinGrace && lastLevel !== undefined) return lastLevel;
+    return 0;
+  }
+  // For an ally the missing information is *ours*, not theirs — their last
+  // known level is the best estimate available, so hold it rather than ducking
+  // the whole team every time tracking hiccups (which happens on every death).
+  const holdable = msSinceSeen === undefined || msSinceSeen <= allyHoldMs;
+  if (holdable && lastLevel !== undefined) return lastLevel;
+  return allyOutOfRangeLevel(curve);
+}
+
+/**
+ * Combine the shaped proximity level with the per-player trim slider and the
  * group/master gains into the final playback gain.
  *
- * Proximity and the slider are clamped to [0, 1] defensively — they are
- * attenuations. The gains are amplifications and may push the result past 1.0,
- * up to MAX_TOTAL_GAIN. With both gains left at 1 this is the original
+ * Level and trim are clamped to [0, 1] defensively — they are attenuations.
+ * The gains are amplifications and may push the result past 1.0, up to
+ * MAX_TOTAL_GAIN. With both gains left at 1 this is the original
  * `proximity × slider`, which is what the pre-existing tests pin down.
  */
 export function computeFinalPeerVolume(

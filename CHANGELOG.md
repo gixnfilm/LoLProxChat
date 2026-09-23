@@ -4,6 +4,78 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.6.1] — 2026-09-23
+
+Fixes teammates playing at full volume everywhere with Proximity = ALL.
+
+### Fixed
+- **Teammates now actually fade with distance.** Two compounding client bugs,
+  both introduced in v0.6.0:
+  - The "no position this tick" fallback (tracking scanning, holding for >2 s,
+    or a failed request) hardcoded every teammate to full volume and ignored
+    the Proximity setting entirely. It runs at the start of every game and
+    every time you die and your icon leaves the minimap.
+  - That synthesised value was then indistinguishable from a real server
+    response, so it refreshed the grace window and was cached as if the server
+    had sent it — and the next fallback tick wrote it again. Teammates latched
+    at full volume and never came back down.
+
+  The fallback now reports "no server data" instead of inventing an answer,
+  and the per-peer decision lives in one pure function with the ally/enemy
+  asymmetry made explicit.
+- **The client was inverting the wrong curve.** It assumed the server's falloff
+  was `1 - (d/1350)²`, which is what `server/src/volumes.ts` says. The deployed
+  server actually runs a plateau plus a short fade:
+
+  | distance | volume |
+  |---|---|
+  | below 900 | full |
+  | 900 → 1350 | `1 - ((d-900)/450)²` |
+  | 1350+ | not sent at all |
+
+  So every distance the client recovered was wrong, and the falloff sliders
+  operated on nonsense. The maths is now expressed as a *fraction* of whatever
+  fade band the server uses (`fadePosition`), which cannot go stale the same
+  way. Measured with the new `scripts/probe-server-curve.mjs` — worst residual
+  0.0 across 14 sample distances.
+
+### Changed
+- **Min Vol (far) now governs teammates beyond hearing range**, and this is the
+  setting that matters most. The radius is ~1350 units on a 14870-unit map —
+  about a lane segment — so a teammate is out of range for most of a game and
+  simply absent from the server's response. Silencing on absence would mean
+  losing your team almost entirely, so they hold at Min Vol instead. It is
+  continuous with the curve (which approaches exactly that value at the
+  cut-off), so crossing the boundary makes no audible step. Set it to 0 for
+  hard silence.
+- **Enemies are never synthesised, in any mode or on any tick.** The server
+  omits out-of-range enemies specifically so no client can hear them; the
+  fallback path must not paper over that. Absent enemy → brief hold → silence.
+- **Fade Start is now a percentage of the server's fade band**, not game units
+  (0–90 %, default 0). Game units were meaningless once the server's real
+  endpoints turned out to differ from the bundled source. A stored v0.6.0
+  `nearRange` is ignored rather than reinterpreted.
+- Per-player sliders and prefs changes now replay the cached *inputs* through
+  the same decision instead of a stored output, so dragging a slider while
+  tracking is still scanning can no longer duck a teammate to silence.
+- The `[Audio] applyPeerVolumes` debug line now carries the proximity mode and
+  whether the tick reached the server at all.
+
+### Added
+- `scripts/probe-server-curve.mjs` — measures the live server's curve, its
+  cut-off, and whether it honours `allyProximity`, then fits the constants.
+  Run it when proximity feels wrong; reading the bundled server source is not
+  enough, as this release demonstrates.
+- A one-shot warning when Proximity = ALL and every teammate comes back at
+  exactly 1.00 for ~30 s — the fingerprint of a server that ignores the flag,
+  which no client-side setting can compensate for.
+
+### Notes
+- Verified against the live server: it *does* honour `allyProximity`. The bug
+  was entirely on our side.
+- Client tests: 162 (was 156).
+
+
 ## [v0.6.0] — 2026-09-22
 
 Fork release. Output levels are adjustable for the first time, and distance
@@ -401,6 +473,7 @@ falloff is configurable instead of fixed.
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.6.1]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.6.1
 [v0.6.0]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.6.0
 [v0.5.7]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.7
 [v0.5.6]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.5.6

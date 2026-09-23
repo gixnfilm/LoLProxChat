@@ -380,31 +380,23 @@ export class Orchestrator {
   }
 
   /**
-   * What to play when this tick has no usable position of our own — CV hasn't
-   * locked yet, lost the player, or the volume request failed.
+   * Signal a tick that has no usable position of our own — CV hasn't locked
+   * yet, lost the player, or the volume request failed.
    *
-   * Teammates keep playing at full volume (scaled by the Team / Master gains);
-   * enemies are simply absent from the map we hand over, so
-   * resolveProximityTargets holds them for the grace window and then fades
-   * them out. That is the honest degradation: without our own coordinates
-   * there is no distance to compute, and enemy audio is the part that depends
-   * on it. The alternative behaviours are both worse — freezing leaves stale
-   * gains stuck forever, and silencing everyone cuts the team off over a
-   * routine CV hiccup.
+   * `null` is the whole point: it tells the mixer "no server data" rather than
+   * handing it a fabricated response. The previous version synthesised 1.0 for
+   * every teammate, which the mixer could not tell apart from a real answer —
+   * so it refreshed the grace window and cached the value as the server's,
+   * and the next fallback tick did it again. Teammates latched at full volume
+   * and never came down, which is exactly the bug this replaces.
    *
-   * Note this overrides Ally-proximity while it is active. Nothing else is
-   * possible: proximity needs a position, and this path is exactly the case
-   * where we don't have one.
+   * The per-peer degradation now lives in resolvePeerLevel: teammates hold
+   * their last level (then fall back to Min Vol far), enemies fade out. An
+   * enemy is never synthesised — the server's range cut-off is a boundary the
+   * client must not paper over.
    */
   private applyFallbackVolumes(): void {
-    if (!this.audio || !this.session) return;
-    const allyVolumes: Record<string, number> = {};
-    for (const [name, state] of this.peerStates) {
-      if (state.team === this.session.localPlayer.team) {
-        allyVolumes[name] = 1.0;
-      }
-    }
-    this.audio.applyPeerVolumes(allyVolumes);
+    this.audio?.applyPeerVolumes(null);
   }
 
   private async handlePeerPosition(peer: PositionBroadcast): Promise<void> {
