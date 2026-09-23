@@ -16,6 +16,29 @@ orchestrator.start();
 console.log('[LoLProxChat] Orchestrator started');
 
 // Listen for messages from overlay (Tauri uses window events instead of Overwolf messaging)
+/**
+ * Catch anything that blows up while a module is still evaluating.
+ *
+ * background.js is loaded before overlay.js, so this is in place before the
+ * overlay runs. That matters because a top-level throw there is silent and
+ * devastating: evaluation stops at the failing line, every listener registered
+ * after it is simply never attached, and the panel keeps rendering perfectly —
+ * showing raw HTML defaults — while half its controls quietly do nothing.
+ *
+ * That is exactly what a const-before-initialisation slip caused in v0.7.1:
+ * the Debug button, auto-update, Hide IP, the whole mixer and Reset were dead,
+ * and neither the type checker nor a screenshot noticed. Written straight to
+ * the log file rather than through console, because console is silenced unless
+ * Debug is on — and Debug was one of the buttons that stopped working.
+ */
+window.addEventListener('error', (e: ErrorEvent) => {
+  const where = e.filename ? ` (${e.filename}:${e.lineno})` : '';
+  const detail = e.error?.stack || e.message || String(e.error);
+  invoke('append_log', {
+    line: new Date().toISOString() + ' [FATAL] Uncaught error' + where + ': ' + detail,
+  }).catch(() => { /* log file may not be open yet */ });
+});
+
 window.addEventListener('overlayAction', ((event: CustomEvent) => {
   const { action, payload } = event.detail;
   console.log('[LoLProxChat] Received action from overlay:', action);

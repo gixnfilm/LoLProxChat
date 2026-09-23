@@ -118,20 +118,40 @@ export function shapeProximity(serverVol: number, curve: ProximityCurve | null):
 /**
  * The level a teammate keeps once they leave the server's hearing radius.
  *
- * This exists because the radius is small relative to the map (see the header):
- * a teammate is out of range far more often than in it, so "absent" is the
- * normal state, not an error. Silencing on absence would mean losing your team
- * for most of the game — strictly worse than the bug it replaced. `floor` is
- * also continuous with the curve, which asymptotes to exactly this value at the
- * cut-off, so crossing the boundary makes no audible step.
+ * `floor` is continuous with the curve, which asymptotes to exactly this value
+ * at the cut-off, so crossing the boundary makes no audible step.
  *
- * Set Min Vol (far) to 0 to get hard silence instead.
+ * It defaults to 0 — out of range means silent, the same as an enemy. A
+ * non-zero floor was tried first, on the reasoning that the radius is small
+ * enough to cost you your team otherwise, but in play it simply sounded like
+ * teammates were audible everywhere, which is the thing proximity chat exists
+ * to avoid. The case that argument was really worried about — not knowing
+ * where anyone is — is handled separately by allyUnknownLevel.
  *
  * With falloff disabled for this peer (`curve === null`, i.e. Proximity OFF or
  * ENEMY) teammates are meant to be unconditionally audible, so it is 1.0.
  */
 function allyOutOfRangeLevel(curve: ProximityCurve | null): number {
   return curve ? clamp(curve.floor, 0, 1) : 1;
+}
+
+/**
+ * What a teammate should sound like when we have no idea where *we* are.
+ *
+ * Always full volume, never the out-of-range level — and the distinction is
+ * the whole point. A teammate missing from the server's response is *evidence*
+ * of distance: the server looked, and they were too far. A tick that never
+ * reached the server is the *absence* of evidence, and the missing piece is
+ * our own position, not theirs.
+ *
+ * Conflating the two silenced entire teams. With the out-of-range level set to
+ * silence, every game began with nobody able to hear anyone: tracking is still
+ * scanning in the fountain, so every tick is a no-data tick, so everyone was
+ * treated as too far away. The same applied after every death and every
+ * tracking hiccup.
+ */
+function allyUnknownLevel(): number {
+  return 1;
 }
 
 export interface PeerLevelInput {
@@ -193,7 +213,7 @@ export function resolvePeerLevel(input: PeerLevelInput): number {
   // the whole team every time tracking hiccups (which happens on every death).
   const holdable = msSinceSeen === undefined || msSinceSeen <= allyHoldMs;
   if (holdable && lastLevel !== undefined) return lastLevel;
-  return allyOutOfRangeLevel(curve);
+  return allyUnknownLevel();
 }
 
 /**

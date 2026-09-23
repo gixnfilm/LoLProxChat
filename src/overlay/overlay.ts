@@ -24,6 +24,29 @@ import { computeDesiredHeight, shouldResendHeight } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
 import '../core/window-globals';
 
+/**
+ * Every control's "read storage and repaint me" function.
+ *
+ * Each one used to be a closure trapped inside its own `queueMicrotask` with
+ * no way to call it again, which made "reset to defaults" impossible to reflect
+ * in the UI without reloading the whole webview — and a reload would leave the
+ * Rust-side key bindings untouched, so the old hotkey would keep firing while
+ * the panel claimed otherwise.
+ *
+ * Declared at the very top of the module, before any caller. `registerResync`
+ * is a hoisted function declaration, so calling it early *looks* fine — but
+ * the array it writes to is a `const`, and touching a `const` before its
+ * initialiser has run throws. That threw during module evaluation, which meant
+ * every line after the first call never ran: the Debug button, auto-update,
+ * Hide IP, the whole mixer, Reset and the key bindings were all dead, and the
+ * panel showed raw HTML defaults instead of stored settings.
+ */
+const resyncers: Array<() => void> = [];
+function registerResync(fn: () => void): void {
+  resyncers.push(fn);
+  queueMicrotask(fn);
+}
+
 // v0.3 (#11): dynamic overlay-window resize so the panel grows to fit
 // debug-thumbnail / settings content and shrinks back when they collapse.
 // requestAnimationFrame-batched so we don't ping Rust at full frame rate
@@ -315,20 +338,6 @@ btnForceTurn.addEventListener('click', () => {
 // next position update with no reconnect.
 const PROXIMITY_ORDER: ProximityMode[] = ['off', 'enemy', 'all'];
 
-/**
- * Every control's "read storage and repaint me" function.
- *
- * Each one used to be a closure trapped inside its own `queueMicrotask` with
- * no way to call it again, which made "reset to defaults" impossible to reflect
- * in the UI without reloading the whole webview — and a reload would leave the
- * Rust-side key bindings untouched, so the old hotkey would keep firing while
- * the panel claimed otherwise.
- */
-const resyncers: Array<() => void> = [];
-function registerResync(fn: () => void): void {
-  resyncers.push(fn);
-  queueMicrotask(fn);
-}
 
 function pushPrefs(patch: Partial<AudioPrefs>): AudioPrefs {
   const next = setAudioPrefs(patch);

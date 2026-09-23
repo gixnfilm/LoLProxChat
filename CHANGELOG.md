@@ -4,6 +4,38 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.7.2] — 2026-09-23
+
+Two bugs introduced in v0.7.0/v0.7.1, both of which made the app worse than the
+version they were meant to fix.
+
+### Fixed
+- **Half the overlay was dead.** The Debug toggle, Debug Logs, auto-update,
+  Hide IP, every mixer slider, Reset, the key bindings and the player list all
+  did nothing, and the panel showed raw HTML defaults instead of your saved
+  settings. A registry added in v0.7.0 was declared below its first caller, so
+  reading it threw while the module was still evaluating — and a top-level
+  throw stops evaluation dead, silently, leaving every listener below that line
+  unattached. The panel still rendered perfectly, which is what made it look
+  like a settings reset rather than a crash.
+
+  This is also why the player list read "Waiting for nearby players" for an
+  entire game: the code that fills it never ran.
+- **Nobody could hear anyone at the start of a game.** v0.7.1 made teammates
+  beyond hearing range silent, which was the intent — but the same value was
+  also used when the client has no position of its own yet. Tracking is still
+  scanning while everyone is in the fountain, so every tick took that path and
+  the whole team was treated as too far away. The two cases are now separate:
+  missing from the server's response is evidence of distance, a tick that never
+  reached the server is the absence of evidence and keeps teammates audible.
+
+### Added
+- A startup error guard in the background script, which loads first. Any
+  uncaught error during module evaluation is now written straight to the log
+  file — not through `console`, which is silenced unless Debug is on, and
+  Debug was one of the buttons that stopped working.
+
+
 ## [v0.7.1] — 2026-09-23
 
 ### Fixed
@@ -570,6 +602,7 @@ falloff is configurable instead of fixed.
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.7.2]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.2
 [v0.7.1]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.1
 [v0.7.0]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.0
 [v0.6.1]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.6.1

@@ -226,16 +226,32 @@ describe('resolvePeerLevel — teammates stay reachable', () => {
     })).toBe(0.62);
   });
 
-  test('a long no-data stretch eventually settles on the floor', () => {
+  test('a long no-data stretch settles on full volume, not the out-of-range level', () => {
+    // These two used to assert the floor, and that assertion encoded a bug.
+    // Once the floor became silence, "we do not know where we are" silenced the
+    // entire team — which is the state every game starts in, because tracking
+    // is still scanning while everyone is in the fountain.
     expect(resolvePeerLevel({
       ...base, tick: NO_DATA, isAlly: true, lastLevel: 0.62, msSinceSeen: 9000,
-    })).toBe(CURVE.floor);
+    })).toBe(1);
   });
 
-  test('no history on a no-data tick → the floor, not full volume', () => {
+  test('no history on a no-data tick → full volume', () => {
     expect(resolvePeerLevel({
       ...base, tick: NO_DATA, isAlly: true,
-    })).toBe(CURVE.floor);
+    })).toBe(1);
+  });
+
+  test('a silent floor still silences a teammate the server says is out of range', () => {
+    // The distinction that matters: absence from a response is evidence of
+    // distance, a tick that never reached the server is absence of evidence.
+    const silent = { ...CURVE, floor: 0 };
+    expect(resolvePeerLevel({
+      ...base, curve: silent, tick: ABSENT, isAlly: true, msSinceSeen: 9000,
+    })).toBe(0);
+    expect(resolvePeerLevel({
+      ...base, curve: silent, tick: NO_DATA, isAlly: true, msSinceSeen: 9000,
+    })).toBe(1);
   });
 
   test('Min Vol (far) 0 gives hard silence beyond the radius', () => {
