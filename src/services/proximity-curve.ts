@@ -216,7 +216,11 @@ export function resolvePeerLevel(input: PeerLevelInput): number {
   }
   // For an ally the missing information is *ours*, not theirs — their last
   // known level is the best estimate available, so hold it rather than ducking
-  // the whole team every time tracking hiccups (which happens on every death).
+  // the whole team every time tracking hiccups.
+  //
+  // Death is NOT one of those hiccups, despite what this comment used to say:
+  // the tracker switches to a DEAD state that keeps reporting the position you
+  // died at, so ticks stay 'server' throughout the respawn timer.
   const holdable = msSinceSeen === undefined || msSinceSeen <= allyHoldMs;
   if (holdable && lastLevel !== undefined) return lastLevel;
   return allyUnknownLevel(everTracked, curve);
