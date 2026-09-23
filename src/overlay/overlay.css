@@ -239,3 +239,18 @@ html, body {
 .settings-heading:first-of-type {
   margin-top: 2px;
 }
+
+/* Tracking health, always visible while a game is running.
+   Previously the only indication lived in the empty-state element, which is
+   removed as soon as a single peer appears — so mid-game, when it actually
+   matters, there was no way to tell that tracking had lost the player. */
+.track-badge {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: #f0b23c;
+  border: 1px solid #f0b23c;
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 6px;
+  white-space: nowrap;
+}

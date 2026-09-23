@@ -46,6 +46,10 @@ export interface AudioPrefs {
   audioBoost: boolean;
   /** Pre-transmission mic gain, 0..1. Mirrors AudioSettings.inputVolume. */
   inputVolume: number;
+  /** How hard voices are panned left/right, 0..1.5. 0 = everything centred. */
+  stereoWidth: number;
+  /** Environment reverb (river) for speakers we can see on the minimap. */
+  reverb: boolean;
 }
 
 export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
@@ -58,6 +62,8 @@ export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
   fadeCurve: 0.7,
   audioBoost: true,
   inputVolume: 1.0,
+  stereoWidth: 1.0,
+  reverb: true,
 });
 
 function num(raw: unknown, fallback: number, lo: number, hi: number): number {
@@ -99,17 +105,24 @@ export function getAudioPrefs(): AudioPrefs {
     teamVolume: num(stored.teamVolume, DEFAULT_AUDIO_PREFS.teamVolume, 0, 2),
     enemyVolume: num(stored.enemyVolume, DEFAULT_AUDIO_PREFS.enemyVolume, 0, 3),
     proximityMode,
-    floor: num(stored.floor, DEFAULT_AUDIO_PREFS.floor, 0, 1),
+    // Deliberately NOT read from storage: Min Vol / Fade Start / Fade Curve
+    // were removed from the UI as too fiddly, and a value left over from when
+    // they were adjustable would be invisible and unfixable. One real log had
+    // fadeCurve pinned at its flattest setting, which is exactly the config
+    // that makes distant players sound close.
+    floor: DEFAULT_AUDIO_PREFS.floor,
     // Note: a stored `nearRange` from v0.6.0 is deliberately NOT migrated. It
     // was in game units against an inverse-curve constant that turned out not
     // to match the live server, so the number is meaningless now; the default
     // is the honest starting point.
-    nearFraction: num(stored.nearFraction, DEFAULT_AUDIO_PREFS.nearFraction, 0, 0.9),
-    fadeCurve: num(stored.fadeCurve, DEFAULT_AUDIO_PREFS.fadeCurve, 0.3, 2),
+    nearFraction: DEFAULT_AUDIO_PREFS.nearFraction,
+    fadeCurve: DEFAULT_AUDIO_PREFS.fadeCurve,
     audioBoost: typeof stored.audioBoost === 'boolean'
       ? stored.audioBoost
       : DEFAULT_AUDIO_PREFS.audioBoost,
     inputVolume: num(stored.inputVolume, DEFAULT_AUDIO_PREFS.inputVolume, 0, 1),
+    stereoWidth: num(stored.stereoWidth, DEFAULT_AUDIO_PREFS.stereoWidth, 0, 1.5),
+    reverb: typeof stored.reverb === 'boolean' ? stored.reverb : DEFAULT_AUDIO_PREFS.reverb,
   };
 }
 
@@ -155,6 +168,35 @@ export function groupGainFor(prefs: AudioPrefs, isAlly: boolean): number {
  */
 export function getAllyProximity(): boolean {
   return getAudioPrefs().proximityMode === 'all';
+}
+
+/**
+ * Every localStorage key this app writes. Kept here so "reset everything"
+ * cannot silently miss one — note `proxchat.autoUpdate`, which does NOT share
+ * the `lolproxchat.` prefix and would be skipped by any prefix sweep.
+ */
+export const ALL_STORAGE_KEYS: readonly string[] = [
+  PREFS_KEY,
+  PLAYER_VOLUMES_KEY,
+  LEGACY_ALLY_PROXIMITY_KEY,
+  'lolproxchat.inputDeviceId',
+  'lolproxchat.outputDeviceId',
+  'lolproxchat.forceTurnRelay',
+  'lolproxchat.pttVk',
+  'lolproxchat.toggleVk',
+  'proxchat.autoUpdate',
+];
+
+/** Wipe every stored setting. The caller still has to re-sync the UI and tell
+ *  the running engine — see resetAllSettings in the overlay. */
+export function clearAllStoredSettings(): void {
+  for (const key of ALL_STORAGE_KEYS) {
+    try {
+      localStorage.removeItem(key);
+    } catch (e) {
+      console.warn('[AudioPrefs] could not clear ' + key + ':', e);
+    }
+  }
 }
 
 // ---- per-player trim sliders -------------------------------------------------

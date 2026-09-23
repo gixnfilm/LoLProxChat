@@ -2,7 +2,10 @@ use base64::Engine;
 use std::sync::Mutex;
 use tauri::State;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetWindowThreadProcessId,
+};
 
 pub struct CaptureState {
     pub bounds: Mutex<Option<CaptureBounds>>,
@@ -21,6 +24,53 @@ pub struct CaptureResult {
     pub data_url: String,
     pub width: i32,
     pub height: i32,
+    /// False when League was not the foreground window at capture time, i.e.
+    /// the pixels below are NOT the minimap. See `league_is_foreground`.
+    pub game_visible: bool,
+}
+
+/// Window class of the League of Legends game client. The launcher/client uses
+/// a different one, so this specifically matches the in-game window.
+const LEAGUE_WINDOW_CLASS: &str = "RiotWindowClass";
+
+/// Whether the League game window is currently in the foreground.
+///
+/// This capture is a plain BitBlt of a fixed screen rectangle — it has no idea
+/// which window it is looking at. Alt-tab away and it happily returns the
+/// desktop, Explorer, or a browser, and every consumer downstream treats those
+/// pixels as a minimap. A real session log showed the tracker doing exactly
+/// that: it lost its lock on blank frames, then re-locked on the first
+/// icon-shaped thing it saw once the game came back, and followed the wrong
+/// champion for the rest of the match.
+///
+/// Reporting visibility lets the caller skip the frame instead of ingesting
+/// nonsense. Failing open (returning true) is deliberate: if the class name
+/// can't be read we would rather track than freeze.
+fn league_is_foreground() -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+
+        // Our own overlay counts as "still in game". It is a normal focusable
+        // window — clicking a slider or binding a key gives it focus — so
+        // treating that as "League is gone" would black out tracking the
+        // moment the user opened Settings.
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            return true;
+        }
+
+        let mut buf = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut buf);
+        if len <= 0 {
+            return true;
+        }
+        let class = String::from_utf16_lossy(&buf[..len as usize]);
+        class == LEAGUE_WINDOW_CLASS
+    }
 }
 
 #[tauri::command]
@@ -32,6 +82,18 @@ pub fn set_capture_bounds(state: State<CaptureState>, bounds: CaptureBounds) {
 /// Returns a base64-encoded BMP data URL that can be loaded as an Image in the webview.
 #[tauri::command]
 pub fn capture_minimap(state: State<CaptureState>) -> Result<CaptureResult, String> {
+    if !league_is_foreground() {
+        // Skipping here also saves the BitBlt, the BMP build and the base64
+        // encode — roughly 30 of those per second that were being spent
+        // photographing the user's desktop.
+        return Ok(CaptureResult {
+            data_url: String::new(),
+            width: 0,
+            height: 0,
+            game_visible: false,
+        });
+    }
+
     let bounds = state.bounds.lock().unwrap();
     let bounds = bounds
         .as_ref()
@@ -89,6 +151,7 @@ pub fn capture_minimap(state: State<CaptureState>) -> Result<CaptureResult, Stri
         data_url: format!("data:image/bmp;base64,{}", b64),
         width,
         height,
+        game_visible: true,
     })
 }
 

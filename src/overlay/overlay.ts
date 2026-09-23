@@ -16,10 +16,11 @@ import {
 } from '../services/devices';
 import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
 import {
-  AudioPrefs, getAudioPrefs, setAudioPrefs, getPlayerVolumes,
+  AudioPrefs, DEFAULT_AUDIO_PREFS, getAudioPrefs, setAudioPrefs, getPlayerVolumes,
+  clearAllStoredSettings,
 } from '../services/audio-prefs';
 import { ProximityMode } from '../services/proximity-curve';
-import { computeDesiredHeight } from './resize-helpers';
+import { computeDesiredHeight, shouldResendHeight } from './resize-helpers';
 import { browserKeyToWin32Vk, humanizeVk } from '../core/keymap';
 import '../core/window-globals';
 
@@ -28,6 +29,10 @@ import '../core/window-globals';
 // requestAnimationFrame-batched so we don't ping Rust at full frame rate
 // when ResizeObserver fires rapidly (image load, etc).
 let resizeQueued = false;
+// Last height actually sent to Rust, so an unchanged layout stops the
+// resize -> relayout -> ResizeObserver -> resize loop dead. See
+// RESIZE_DEAD_BAND_PX for the measurement that motivated this.
+let lastSentHeight: number | null = null;
 function syncOverlayHeight(): void {
   if (resizeQueued) return;
   resizeQueued = true;
@@ -43,7 +48,10 @@ function syncOverlayHeight(): void {
     // 100% ultrawide looked fine. Matches the panelResize convention below.
     const dpr = window.devicePixelRatio || 1;
     const desired = computeDesiredHeight(Math.ceil(panel.scrollHeight));
-    sendToBackground('resizeOverlay', { height: Math.round(desired * dpr) });
+    const height = Math.round(desired * dpr);
+    if (!shouldResendHeight(height, lastSentHeight)) return;
+    lastSentHeight = height;
+    sendToBackground('resizeOverlay', { height });
   });
 }
 
@@ -61,6 +69,7 @@ interface OverlayState {
   muteAll: boolean;
   nearbyPeers: NearbyPeer[];
   trackingState?: string;
+  trackingHoldSec?: number;
   lastPosition?: { x: number; y: number } | null;
   filteredImageUrl?: string | null;
   detectedMinimapBounds?: { screenX: number; screenY: number; screenWidth: number; screenHeight: number } | null;
@@ -202,7 +211,7 @@ function syncAutoUpdateButton(): void {
   btnAutoUpdate.textContent = on ? 'ON' : 'OFF';
   btnAutoUpdate.classList.toggle('active', on);
 }
-queueMicrotask(syncAutoUpdateButton);
+registerResync(syncAutoUpdateButton);
 
 btnAutoUpdate.addEventListener('click', () => {
   setAutoUpdateEnabled(!isAutoUpdateEnabled());
@@ -248,7 +257,7 @@ function syncForceTurnButton(): void {
   btnForceTurn.textContent = on ? 'ON' : 'OFF';
   btnForceTurn.classList.toggle('active', on);
 }
-queueMicrotask(syncForceTurnButton);
+registerResync(syncForceTurnButton);
 btnForceTurn.addEventListener('click', () => {
   setForceTurnRelay(!getForceTurnRelay());
   syncForceTurnButton();
@@ -266,6 +275,21 @@ btnForceTurn.addEventListener('click', () => {
 // next position update with no reconnect.
 const PROXIMITY_ORDER: ProximityMode[] = ['off', 'enemy', 'all'];
 
+/**
+ * Every control's "read storage and repaint me" function.
+ *
+ * Each one used to be a closure trapped inside its own `queueMicrotask` with
+ * no way to call it again, which made "reset to defaults" impossible to reflect
+ * in the UI without reloading the whole webview — and a reload would leave the
+ * Rust-side key bindings untouched, so the old hotkey would keep firing while
+ * the panel claimed otherwise.
+ */
+const resyncers: Array<() => void> = [];
+function registerResync(fn: () => void): void {
+  resyncers.push(fn);
+  queueMicrotask(fn);
+}
+
 function pushPrefs(patch: Partial<AudioPrefs>): AudioPrefs {
   const next = setAudioPrefs(patch);
   sendToBackground('updateAudioPrefs', next);
@@ -277,6 +301,7 @@ function syncProximityButton(mode: ProximityMode): void {
   btnProximityMode.textContent = mode.toUpperCase();
   btnProximityMode.classList.toggle('active', mode !== 'off');
 }
+registerResync(() => syncProximityButton(getAudioPrefs().proximityMode));
 btnProximityMode.addEventListener('click', () => {
   const current = getAudioPrefs().proximityMode;
   const next = PROXIMITY_ORDER[(PROXIMITY_ORDER.indexOf(current) + 1) % PROXIMITY_ORDER.length];
@@ -288,6 +313,7 @@ function syncAudioBoostButton(on: boolean): void {
   btnAudioBoost.textContent = on ? 'ON' : 'OFF';
   btnAudioBoost.classList.toggle('active', on);
 }
+registerResync(() => syncAudioBoostButton(getAudioPrefs().audioBoost));
 btnAudioBoost.addEventListener('click', () => {
   syncAudioBoostButton(pushPrefs({ audioBoost: !getAudioPrefs().audioBoost }).audioBoost);
 });
@@ -311,7 +337,7 @@ function bindMixerSlider(
     input.value = String(raw);
     label.textContent = String(raw);
   };
-  queueMicrotask(() => sync(getAudioPrefs()));
+  registerResync(() => sync(getAudioPrefs()));
   input.addEventListener('input', () => {
     const raw = Number(input.value);
     if (!Number.isFinite(raw)) return;
@@ -323,14 +349,76 @@ function bindMixerSlider(
 bindMixerSlider('input-master-vol', 'master-vol-label', 'masterVolume', r => r / 100, v => v * 100);
 bindMixerSlider('input-team-vol', 'team-vol-label', 'teamVolume', r => r / 100, v => v * 100);
 bindMixerSlider('input-enemy-vol', 'enemy-vol-label', 'enemyVolume', r => r / 100, v => v * 100);
-bindMixerSlider('input-floor', 'floor-label', 'floor', r => r / 100, v => v * 100);
-bindMixerSlider('input-near-range', 'near-range-label', 'nearFraction', r => r / 100, v => v * 100);
-bindMixerSlider('input-fade-curve', 'fade-curve-label', 'fadeCurve', r => r / 100, v => v * 100);
+bindMixerSlider('input-stereo', 'stereo-label', 'stereoWidth', r => r / 100, v => v * 100);
 
-queueMicrotask(() => {
-  const prefs = getAudioPrefs();
-  syncProximityButton(prefs.proximityMode);
-  syncAudioBoostButton(prefs.audioBoost);
+const btnReverb = document.getElementById('btn-reverb') as HTMLButtonElement;
+function syncReverbButton(on: boolean): void {
+  btnReverb.textContent = on ? 'ON' : 'OFF';
+  btnReverb.classList.toggle('active', on);
+}
+registerResync(() => syncReverbButton(getAudioPrefs().reverb));
+btnReverb.addEventListener('click', () => {
+  syncReverbButton(pushPrefs({ reverb: !getAudioPrefs().reverb }).reverb);
+});
+
+/**
+ * Restore the factory state.
+ *
+ * Clearing storage is the easy part; three things have to happen alongside it
+ * or the reset is a lie:
+ *   • the PTT / toggle-mute keys live in Rust atomics, and the startup push
+ *     that syncs them is conditional on the stored keys existing — after a
+ *     clear it sends nothing, so the old hotkey would keep working silently.
+ *   • the per-player slider map is held in memory here, so cleared storage
+ *     alone leaves every row at its old position.
+ *   • the running AudioService snapshots prefs at construction and only
+ *     learns about changes when it is told.
+ */
+function resetAllSettings(): void {
+  clearAllStoredSettings();
+
+  sendToBackground('setPttKey', { vk: DEFAULT_PTT_VK });
+  sendToBackground('setToggleKey', { vk: 0 });
+  sendToBackground('updateAudioPrefs', getAudioPrefs());
+  sendToBackground('updateSettings', {
+    inputVolume: DEFAULT_AUDIO_PREFS.inputVolume,
+    inputMode: 'always',
+  });
+  sendToBackground('setInputDevice', { id: null });
+  sendToBackground('setOutputDevice', { id: null });
+
+  // The audio engine holds its own copy of the trims and only learns about
+  // changes when told, so clearing storage and the overlay's cache would still
+  // leave a player muted at 20% for the rest of the game.
+  for (const name of playerVolumes.keys()) {
+    sendToBackground('setPlayerVolume', { name, volume: 1.0 });
+  }
+  playerVolumes.clear();
+  for (const fn of resyncers) {
+    try { fn(); } catch (e) { console.warn('[Overlay] resync failed:', e); }
+  }
+  void refreshDeviceLists();
+  console.log('[Overlay] All settings reset to defaults');
+}
+
+const btnResetAll = document.getElementById('btn-reset-all') as HTMLButtonElement;
+let resetArmed: ReturnType<typeof setTimeout> | null = null;
+function disarmReset(): void {
+  if (resetArmed !== null) { clearTimeout(resetArmed); resetArmed = null; }
+  btnResetAll.textContent = 'RESET';
+  btnResetAll.classList.remove('active');
+}
+btnResetAll.addEventListener('click', () => {
+  if (resetArmed === null) {
+    // Two-step confirm rather than a dialog: a JS confirm() would block the
+    // whole WebView, and a blocked WebView stops the minimap scan dead.
+    btnResetAll.textContent = 'SURE?';
+    btnResetAll.classList.add('active');
+    resetArmed = setTimeout(disarmReset, 3000);
+    return;
+  }
+  disarmReset();
+  resetAllSettings();
 });
 
 // v0.3 (#1): PTT + toggle-mute key rebind. The Rust WH_KEYBOARD_LL hook
@@ -461,7 +549,7 @@ document.getElementById('input-mode')!.addEventListener('change', (e) => {
 
 const volumeInput = document.getElementById('input-volume') as HTMLInputElement;
 const volumeLabel = document.getElementById('volume-label')!;
-queueMicrotask(() => {
+registerResync(() => {
   const stored = Math.round(getAudioPrefs().inputVolume * 100);
   volumeInput.value = String(stored);
   volumeLabel.textContent = String(stored);
@@ -681,6 +769,21 @@ function renderState(state: OverlayState): void {
 
   // Debug info: tracking state + position (only when debug enabled)
   const dbgEl = document.getElementById('debug-info')!;
+  // Tracking health badge — outside the Debug gate and outside the
+  // peers-empty branch on purpose, because "enemies went silent" is almost
+  // always this and the user had no way to see it.
+  const trackBadge = document.getElementById('track-badge');
+  if (trackBadge) {
+    // Scanning is the obvious case, but a LOCKED tracker that has been holding
+    // for more than a couple of seconds is the one that actually silences
+    // enemies — the orchestrator stops sending coordinates at exactly that
+    // threshold. Leaving it hidden then would hide the very situation people
+    // report.
+    const lost = state.trackingState === 'scanning' || (state.trackingHoldSec ?? 0) > 2;
+    trackBadge.textContent = lost ? 'FINDING YOU' : '';
+    trackBadge.classList.toggle('hidden', !lost);
+  }
+
   if (debugEnabled && (state.trackingState || state.lastPosition)) {
     const parts: string[] = [];
     if (state.trackingState) parts.push('tracking: ' + state.trackingState);

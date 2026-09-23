@@ -38,6 +38,10 @@ export class SignalingService {
   } | null = null;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Fired after a dropped socket has successfully rejoined, so the caller can
+  // rebuild anything the other clients tore down while we were away.
+  private onReconnected: (() => void) | null = null;
+  private hasDisconnected = false;
   private intentionallyClosed = false;
 
   joinRoom(
@@ -48,7 +52,13 @@ export class SignalingService {
     onSignal: OnSignal,
     onPeerLeave: OnPeerLeave,
     onPeerJoined?: OnPeerJoined,
+    onReconnected?: () => void,
   ): void {
+    this.onReconnected = onReconnected ?? null;
+    // A socket still in reconnect backoff when the last game ended would
+    // otherwise make the next game's very first connection look like a
+    // reconnect, tearing down peers that were never established.
+    this.hasDisconnected = false;
     this.localName = localName;
     this.currentRoomId = roomId;
     this.currentTeam = team;
@@ -76,6 +86,10 @@ export class SignalingService {
     ws.addEventListener('open', () => {
       console.log('[Signaling] WebSocket connected');
       this.reconnectAttempt = 0;
+      if (this.hasDisconnected) {
+        this.hasDisconnected = false;
+        this.onReconnected?.();
+      }
       // v0.3: include team in join. Older servers ignore the extra field.
       ws.send(JSON.stringify({ type: 'join', room: roomId, name: localName, team }));
     });
@@ -147,6 +161,7 @@ export class SignalingService {
     ws.addEventListener('close', () => {
       console.log('[Signaling] WebSocket disconnected');
       if (this.intentionallyClosed) return;
+      this.hasDisconnected = true;
       // Exponential backoff capped at 30s
       this.reconnectAttempt++;
       const delayMs = Math.min(30000, 500 * Math.pow(2, this.reconnectAttempt - 1));

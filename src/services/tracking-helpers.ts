@@ -163,3 +163,69 @@ export function shouldForceReacquisition(holdStartMs: number, nowMs: number): bo
 export function nextClassifierEma(currentEma: number, raw: number, decay: number): number {
   return currentEma * decay + raw * (1 - decay);
 }
+
+/**
+ * Minimum composite score required to accept a SCANNING -> LOCKED transition,
+ * and how that bar relaxes the longer we fail to find anything better.
+ *
+ * Why this exists, from a real session log (2026-09-23, 13:23:06-13:24:09):
+ *
+ *     Hold exceeded 5000ms — forcing re-acquisition (back to SCANNING)
+ *     SCANNING -> LOCKED via composite(score=0.28)
+ *     Hold exceeded 5000ms …
+ *     SCANNING -> LOCKED via composite(score=0.26)
+ *     … eleven cycles in 63 seconds, every score between 0.23 and 0.29,
+ *       with "Classifier scores: raw=0.000" — the classifier explicitly
+ *       saying "none of these is your champion" …
+ *     13:26:17  SCANNING -> LOCKED via composite(score=0.74)   ← a healthy lock
+ *
+ * The transition had no absolute bar at all: it took the best available blob no
+ * matter how bad. Locking onto a teammate's icon is then permanent, because the
+ * only exit from LOCKED is a 5 s hold and a wrong-but-followable blob never
+ * holds — so wrong coordinates go out at 10 Hz for the rest of the game.
+ *
+ * The bar decays rather than being fixed, because v0.3.0 shipped a hard
+ * classifier gate here and had to revert it in v0.3.1: champions the classifier
+ * is weak on could never clear it, so the tracker refused to lock at all and
+ * broadcast no position whatsoever. Decaying to roughly the old behaviour means
+ * the worst case is "we waited a few seconds first", never "we never lock".
+ */
+export const LOCK_SCORE_STRICT = 0.45;
+export const LOCK_SCORE_FLOOR = 0.20;
+/** How long the strict bar is held before it starts giving way. */
+export const LOCK_THRESHOLD_HOLD_MS = 2000;
+export const LOCK_THRESHOLD_DECAY_MS = 8000;
+
+export function lockScoreThreshold(scanElapsedMs: number): number {
+  if (!Number.isFinite(scanElapsedMs) || scanElapsedMs <= LOCK_THRESHOLD_HOLD_MS) {
+    return LOCK_SCORE_STRICT;
+  }
+  if (scanElapsedMs >= LOCK_THRESHOLD_DECAY_MS) return LOCK_SCORE_FLOOR;
+  // The bar is held flat first rather than decaying from the instant scanning
+  // starts, because one of the eleven bad locks in the log scored 0.44 — close
+  // enough to a healthy lock that an immediate decay would have let it through
+  // within a second. A fresh scan that is going to find the right icon finds it
+  // quickly; giving way only after a couple of seconds costs nothing real.
+  const t = (scanElapsedMs - LOCK_THRESHOLD_HOLD_MS) /
+    (LOCK_THRESHOLD_DECAY_MS - LOCK_THRESHOLD_HOLD_MS);
+  return LOCK_SCORE_STRICT - (LOCK_SCORE_STRICT - LOCK_SCORE_FLOOR) * t;
+}
+
+/**
+ * How much better another blob's classifier score must be than the one we are
+ * following, and for how long, before we abandon the lock.
+ *
+ * This is the escape hatch from a confidently-wrong lock. It is deliberately
+ * *relative*: an absolute "is the tracked blob still plausible" test would fire
+ * constantly for champions the classifier scores poorly across the board (the
+ * exact failure that got the v0.3.0 gate reverted). Asking "is there a clearly
+ * better candidate than the one I am following" is immune to that, because a
+ * uniformly weak classifier produces no clear winner either.
+ */
+export const LOCK_CHALLENGE_MARGIN = 0.35;
+export const LOCK_CHALLENGE_MS = 3000;
+
+export function shouldAbandonLock(challengeStartMs: number, nowMs: number): boolean {
+  if (challengeStartMs <= 0) return false;
+  return nowMs - challengeStartMs >= LOCK_CHALLENGE_MS;
+}

@@ -7,10 +7,20 @@ import { TrackingService, TrackingState } from './tracking';
 import { ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getAudioPrefs, AudioPrefs } from './audio-prefs';
-import { PeerState } from '../core/types';
+import { PeerState, Position } from '../core/types';
+import { locatePeers, AudiblePeer } from './peer-locator';
+import { isInRiver } from './river-mask';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
 
+
+/**
+ * How long the orchestrator tolerates having no usable own position before it
+ * tears the tracker down and rescans. Long enough not to fight a normal
+ * death-and-respawn (which legitimately produces no position), short enough
+ * that a wedged or mis-locked tracker doesn't ruin a whole game.
+ */
+const TRACKING_WATCHDOG_MS = 12000;
 
 export class Orchestrator {
   private gameState: GameStateService;
@@ -28,6 +38,13 @@ export class Orchestrator {
   private positionTickRunning = false;
   // Consecutive /compute-volumes failures, for throttling the error log.
   private volumeFailures = 0;
+  // performance.now() of the last tick that had a usable own position, and of
+  // the last forced rescan, so the watchdog neither fires early nor loops.
+  private lastGoodPositionMs = 0;
+  private lastForcedRescanMs = 0;
+  // Where each peer was last confidently seen, so a binding made in a clear
+  // moment survives the crowded frames that follow.
+  private peerPositions: Map<string, Position> = new Map();
   private sessionActive = false;
   private lastOverlayRepositionTime = 0;
   private lastOverlayBounds: { x: number; y: number; w: number; h: number } | null = null;
@@ -169,6 +186,13 @@ export class Orchestrator {
       this.audio = null;
       return;
     }
+    // performance.now() runs for the life of the process, so leftovers from a
+    // previous game would read as "no position for several minutes" and fire a
+    // forced rescan on a tracker that started milliseconds ago.
+    this.lastGoodPositionMs = 0;
+    this.lastForcedRescanMs = 0;
+    this.peerPositions = new Map();
+
     // Carry over any mute toggles the user set before/between sessions.
     this.audio.setSelfMuted(this.selfMutedPref);
     this.audio.setMuteAll(this.muteAllPref);
@@ -187,6 +211,8 @@ export class Orchestrator {
       (peer) => this.handlePeerPosition(peer),
       (signal) => this.handleSignal(signal),
       (name) => this.handlePeerLeave(name),
+      undefined,
+      () => this.handleSignalingReconnect(),
     );
 
     this.sessionActive = true;
@@ -306,6 +332,8 @@ export class Orchestrator {
     // only returns names.
     this.audio.setPeerTeams(this.peerSides());
 
+    this.trackingWatchdog();
+
     // Before CV locks on (SCANNING), pass through all ally audio at full volume (fountain)
     if (this.tracking.getState() === TrackingState.SCANNING) {
       this.applyFallbackVolumes();
@@ -330,6 +358,8 @@ export class Orchestrator {
       return;
     }
 
+    this.lastGoodPositionMs = performance.now();
+
     // Push our latest XY to server-side room state. /compute-volumes reads
     // every peer's stored position from there — no more P2P blob exchange.
     this.signaling.sendCoords(position.x, position.y);
@@ -351,6 +381,7 @@ export class Orchestrator {
         this.localSummonerName,
         getAllyProximity(),
       );
+      this.updatePeerPositions(position, result.peerVolumes);
       this.audio.applyPeerVolumes(result.peerVolumes);
       this.volumeFailures = 0;
     } catch (e) {
@@ -367,6 +398,67 @@ export class Orchestrator {
     }
 
     this.broadcastOverlayState();
+  }
+
+  /**
+   * Work out which visible minimap icon belongs to which voice, and hand the
+   * result to the mixer for panning and reverb.
+   *
+   * Everything here comes from our own minimap — nothing is exchanged with
+   * other clients. That is what makes directional audio legitimate for
+   * enemies: an icon we can see is a position the game already gave us, while
+   * sending coordinates over the network would have been a wallhack.
+   */
+  private updatePeerPositions(self: Position, peerVolumes: Record<string, number>): void {
+    if (!this.audio || !this.tracking || !this.session) return;
+
+    const icons = this.tracking.getLastIcons();
+    const sides = this.peerSides();
+    const peers: AudiblePeer[] = [];
+    for (const [name, vol] of Object.entries(peerVolumes)) {
+      if (typeof vol !== 'number' || !Number.isFinite(vol) || vol <= 0) continue;
+      peers.push({ name, side: sides.get(name) === 'enemy' ? 'enemy' : 'ally', serverVol: vol });
+    }
+
+    const located = locatePeers({
+      self,
+      icons: icons.slice(),
+      peers,
+      previous: this.peerPositions,
+    });
+    this.peerPositions = located;
+
+    // Reverb follows the SPEAKER's surroundings, which is only knowable for
+    // someone we can actually see — an unseen speaker stays dry rather than
+    // borrowing our own surroundings and implying a location we don't have.
+    const wet = new Set<string>();
+    const mapType = this.session.mapType;
+    for (const [name, pos] of located) {
+      if (isInRiver(pos, mapType)) wet.add(name);
+    }
+    this.audio.setPeerPositions(self, located, wet);
+  }
+
+  /**
+   * Force a fresh scan when tracking has produced nothing usable for a while.
+   *
+   * Cross-team audio depends strictly on our own position, so a tracker that
+   * quietly stops producing one silences every enemy with no indication why.
+   * Before this there was no recovery path at all: the only exit from a bad
+   * LOCKED state was a 5 s hold, and a tick wedged mid-capture never even got
+   * that far.
+   */
+  private trackingWatchdog(): void {
+    if (!this.tracking) return;
+    const now = performance.now();
+    if (this.lastGoodPositionMs === 0) this.lastGoodPositionMs = now;
+    const sinceGood = now - this.lastGoodPositionMs;
+    const sinceRescan = now - this.lastForcedRescanMs;
+    if (sinceGood < TRACKING_WATCHDOG_MS || sinceRescan < TRACKING_WATCHDOG_MS) return;
+    this.lastForcedRescanMs = now;
+    this.lastGoodPositionMs = now;
+    this.tracking.forceRescan('no usable position for ' +
+      Math.round(sinceGood / 1000) + 's');
   }
 
   /** summonerName → side, from the roster the orchestrator already tracks. */
@@ -396,7 +488,32 @@ export class Orchestrator {
    * client must not paper over.
    */
   private applyFallbackVolumes(): void {
+    // No position of our own means no frame of reference, so drop every
+    // binding and centre everyone rather than panning against a stale one.
+    this.peerPositions = new Map();
+    this.audio?.setPeerPositions(null, new Map(), new Set());
     this.audio?.applyPeerVolumes(null);
+  }
+
+  /**
+   * Our socket dropped and came back. Every other client saw us leave and threw
+   * away their RTCPeerConnection to us, but we kept ours — so `hasPeer` stayed
+   * true, we never re-offered, and whichever side was the designated initiator
+   * sat waiting for an offer that would never come. Roughly half the room was
+   * lost for the rest of the game, deterministically by name ordering.
+   *
+   * Dropping our own side of every connection puts both ends in the same state
+   * and lets the normal discovery path rebuild them.
+   */
+  private handleSignalingReconnect(): void {
+    if (!this.audio) return;
+    const names = Array.from(this.peerStates.keys());
+    if (names.length === 0) return;
+    console.warn('[LoLProxChat] Signaling reconnected — rebuilding ' +
+      names.length + ' peer connection(s)');
+    for (const name of names) this.audio.disconnectPeer(name);
+    this.peerStates.clear();
+    this.broadcastOverlayState();
   }
 
   private async handlePeerPosition(peer: PositionBroadcast): Promise<void> {
@@ -489,6 +606,7 @@ export class Orchestrator {
       muteAll: this.muteAllPref,
       nearbyPeers,
       trackingState: this.tracking?.getState() ?? 'none',
+      trackingHoldSec: this.tracking?.getHoldDurationSec() ?? 0,
       lastPosition: this.tracking?.getLastPosition() ?? null,
       filteredImageUrl: this.tracking?.getFilteredImageUrl() ?? null,
       detectedMinimapBounds: this.tracking?.getDetectedMinimapScreenBounds() ?? null,
@@ -555,9 +673,10 @@ export class Orchestrator {
     const clamped = Math.max(1, Math.min(60, Math.round(fps)));
     console.log('[LoLProxChat] Scan rate changed to ' + clamped + ' FPS');
     this.tracking.stop();
-    this.tracking.start(() => {
-      // Position updates handled by volume tick
-    }, clamped);
+    // Pass the SAME callback start() was originally given. Installing an empty
+    // one here permanently killed the fast overlay refresh for the rest of the
+    // session — touching the Scan Rate slider once was enough.
+    this.tracking.start(() => this.broadcastOverlayState(), clamped);
   }
   setPTTState(held: boolean): void { this.audio?.setPTTState(held); }
   /** Mixer settings changed in the overlay — persistence is the caller's job. */

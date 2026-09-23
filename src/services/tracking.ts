@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Position, MapType, MAP_DIMENSIONS } from '../core/types';
+import { IconObservation } from './peer-locator';
 import { getMinimapBounds, MinimapBounds } from '../core/map-calibration';
 import { ChampionClassifier } from './champion-classifier';
 import {
@@ -13,7 +14,18 @@ import {
   nextClassifierEma,
   shouldForceReacquisition,
   FORCED_REACQUIRE_HOLD_MS,
+  // v0.7: lock-quality gate + escape from a confidently-wrong lock
+  lockScoreThreshold,
+  shouldAbandonLock,
+  LOCK_CHALLENGE_MARGIN,
 } from './tracking-helpers';
+
+/**
+ * How long an in-flight scan tick may run before we assume it will never
+ * finish and take the lock back. Generous on purpose — a slow classifier pass
+ * at a high scan rate is normal; a multi-second stall is not.
+ */
+const TICK_STUCK_MS = 4000;
 
 export enum TrackingState {
   SCANNING = 'scanning',
@@ -32,6 +44,12 @@ export class TrackingService {
   private screenHeight: number;
   private mapType: MapType;
   private intervalId: number | null = null;
+  // Scan rate the loop is running at, so forceRescan can restore it.
+  private currentFps = 30;
+  // performance.now() when the in-flight tick started; 0 = idle.
+  private tickStartedMs = 0;
+  // Icons from the most recent frame, in game units, minus our own.
+  private lastIcons: IconObservation[] = [];
   private onPositionUpdate: ((pos: Position) => void) | null = null;
 
   // Minimap region (detected or set by calibration/config)
@@ -90,6 +108,12 @@ export class TrackingService {
 
   // Diagnostics
   private lockedTickCount = 0;
+  // performance.now() since another icon started clearly out-scoring the one we
+  // are following; 0 = no active challenge. See maybeAbandonLock.
+  private lockChallengeStartMs = 0;
+  // Region-relative centroid of the blob currently out-scoring the tracked one,
+  // so we can tell a persistent challenger from classifier noise.
+  private lockChallengeRival: { x: number; y: number } | null = null;
   private diagCounter = 0;
 
   constructor(screenWidth: number, screenHeight: number, mapType: MapType) {
@@ -401,7 +425,30 @@ export class TrackingService {
     this.lastClassifierRunMs = 0;
     this.lastClassifierLogMs = 0;
     this.tickRunning = false;
+    this.tickStartedMs = 0;
+    this.currentFps = fps;
     this.intervalId = window.setInterval(() => this.tick(), intervalMs);
+  }
+
+  /**
+   * Throw away all tracking state and start scanning from scratch.
+   *
+   * The orchestrator's watchdog calls this when no usable position has arrived
+   * for a long time. Built on stop()/start() because start() already resets
+   * every piece of state that can wedge — the tick lock, the scan warmup
+   * window and the hold timer.
+   */
+  forceRescan(reason: string): void {
+    if (this.intervalId === null) return;
+    console.warn('[Tracking] Forcing a full rescan: ' + reason);
+    const cb = this.onPositionUpdate;
+    const fps = this.currentFps;
+    this.stop();
+    this.state = TrackingState.SCANNING;
+    this.lastPixelPos = null;
+    this.classifierScores.clear();
+    this.smoothedClassifierScores.clear();
+    if (cb) this.start(cb, fps);
   }
 
   stop(): void {
@@ -761,15 +808,46 @@ export class TrackingService {
 
     // Drop tick if the previous one is still in flight (capture + CV + classifier
     // can exceed the interval at high scan rates). Better to skip than to pile up.
-    if (this.tickRunning) return;
-    this.tickRunning = true;
-
     const tickNow = performance.now();
+    if (this.tickRunning) {
+      // A tick that never settles wedges the scan loop permanently and
+      // silently: the interval keeps firing, every call returns here, and the
+      // tracker freezes in whatever state it was in. One capture promise that
+      // never resolves, or an Image that fires neither load nor error, is
+      // enough. Nothing upstream notices — the orchestrator simply stops
+      // getting positions, which the user experiences as "proximity broke".
+      if (this.tickStartedMs > 0 && tickNow - this.tickStartedMs > TICK_STUCK_MS) {
+        console.warn('[Tracking] Tick wedged for ' +
+          Math.round(tickNow - this.tickStartedMs) + 'ms — releasing the lock and retrying');
+        this.tickRunning = false;
+      } else {
+        return;
+      }
+    }
+    this.tickRunning = true;
+    this.tickStartedMs = tickNow;
+
     this.lastDtSec = (tickNow - this.lastTickMs) / 1000;
     this.lastTickMs = tickNow;
 
-    invoke<{ data_url: string; width: number; height: number }>('capture_minimap')
+    invoke<{ data_url: string; width: number; height: number; game_visible?: boolean }>('capture_minimap')
       .then((result) => {
+        if (result.game_visible === false) {
+          // League isn't the foreground window, so those pixels would be the
+          // desktop. Ingesting them is how the tracker ends up locked onto
+          // whatever icon-shaped thing happens to be on screen.
+          //
+          // Skipping the frame is not enough on its own: the hold timer lives
+          // in handleLocked, which we are bypassing, so without aging the
+          // position here getHoldDurationSec() would stay at 0 forever. The
+          // orchestrator's staleness gate would never trip and it would keep
+          // broadcasting the position from the moment of the alt-tab, for as
+          // long as the user stayed away.
+          this.handleBlackout();
+          this.tickRunning = false;
+          this.tickStartedMs = 0;
+          return;
+        }
         const img = new Image();
         img.onload = () => {
           try {
@@ -791,6 +869,7 @@ export class TrackingService {
             mask = this.dilate(mask, region.width, region.height);
             const allBlobs = this.findBlobs(mask, region.width, region.height);
             const iconBlobs = this.filterIconBlobs(allBlobs);
+            this.cacheIconObservations(iconBlobs, region);
 
             // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
             // This is what makes the debug overlay feel "live" without paying the
@@ -854,7 +933,20 @@ export class TrackingService {
     if (!this.minimapRegion) return;
 
     const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
-    if (tealBlobs.length === 0) return;
+    if (tealBlobs.length === 0) {
+      // Nothing on screen at all — alt-tabbed away, loading screen, or the
+      // capture grabbed the desktop. Restart the warmup window and drop the
+      // classifier history: otherwise the warmup expires while blank frames
+      // stream past, and the first frame that DOES contain a champion gets
+      // locked immediately, scored against an EMA built from whatever was on
+      // the desktop. That is the worst possible moment to choose, and the
+      // choice sticks for the rest of the game.
+      this.scanStartMs = performance.now();
+      this.scanFrameCount = 0;
+      this.classifierScores.clear();
+      this.smoothedClassifierScores.clear();
+      return;
+    }
 
     this.scanFrameCount++;
 
@@ -888,13 +980,23 @@ export class TrackingService {
       }
     }
 
-    // v0.3.1: reverted the v0.3.0 shouldAcceptLocked classifier gate. It hard-
-    // blocked this transition whenever classifier confidence was low, which is
-    // the normal case for champions the 172-class classifier is weak on (e.g.
-    // Teemo) — so the tracker refused to lock at all and never broadcast a
-    // position. The classifier still contributes to the composite score above;
-    // it's just no longer a veto. The whole classifier-confidence path is being
-    // replaced by template matching in v0.4 (docs/plans/2026-06-03-cv-tracking-research.md).
+    // v0.3.1 reverted a hard classifier veto here because it could block the
+    // lock forever for champions the classifier is weak on. This is the same
+    // idea made safe: a bar on the COMPOSITE score that relaxes with time, so
+    // the worst case is a delayed lock rather than no lock at all. See
+    // lockScoreThreshold for the log evidence — eleven consecutive locks at
+    // 0.23-0.29 onto blobs the classifier scored 0.000, each one permanent.
+    const threshold = lockScoreThreshold(performance.now() - this.scanStartMs);
+    if (bestScore < threshold) {
+      if (this.scanFrameCount % 30 === 0) {
+        console.log('[Tracking] Holding off lock: best score ' + bestScore.toFixed(2) +
+          ' < ' + threshold.toFixed(2) + ' (' + tealBlobs.length + ' candidates)');
+      }
+      if (this.onPositionUpdate && this.lastPosition) {
+        this.onPositionUpdate(this.lastPosition);
+      }
+      return;
+    }
     this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ')');
   }
 
@@ -909,6 +1011,7 @@ export class TrackingService {
     this.setLastPosition(this.pixelToGamePosition(cx, cy, this.minimapRegion), 'lockOnBlob');
     this.state = TrackingState.LOCKED;
     this.lockedTickCount = 0;
+    this.lockChallengeStartMs = 0;
     this.scanFrameCount = 0;
     this.scanStartMs = performance.now();
     this.holdStartMs = 0;
@@ -1013,7 +1116,155 @@ export class TrackingService {
       return;
     }
 
+    // Abandoning means the blob we were following is not us — so it must not
+    // then be used to update position and velocity.
+    if (this.maybeAbandonLock(phase1.blob, tealBlobs, hasClassifier, now)) return;
     this.finalizeLockedFrame(phase1.blob, lastReg, holdSec);
+  }
+
+  /**
+   * Break out of a confidently-wrong lock.
+   *
+   * The only other exit from LOCKED is a 5 s hold, which never happens when we
+   * are happily following the wrong champion — that is exactly how a lock onto
+   * a teammate's icon survives a whole game, sending their coordinates as ours.
+   *
+   * The test is relative on purpose (see LOCK_CHALLENGE_MARGIN): we abandon
+   * only when some other blob has out-scored the tracked one by a clear margin
+   * continuously for LOCK_CHALLENGE_MS. A uniformly weak classifier produces no
+   * such challenger, so this cannot strand a legitimate lock the way an
+   * absolute confidence test would.
+   */
+  private maybeAbandonLock(
+    tracked: Blob, tealBlobs: Blob[], hasClassifier: boolean, now: number,
+  ): boolean {
+    if (!hasClassifier || tealBlobs.length < 2) {
+      this.lockChallengeStartMs = 0;
+      this.lockChallengeRival = null;
+      return false;
+    }
+    const trackedScore = this.getClassifierScore(tracked);
+    let bestRival = 0;
+    let rivalBlob: Blob | null = null;
+    for (const b of tealBlobs) {
+      if (b === tracked) continue;
+      const sc = this.getClassifierScore(b);
+      if (sc > bestRival) { bestRival = sc; rivalBlob = b; }
+    }
+
+    if (bestRival - trackedScore < LOCK_CHALLENGE_MARGIN || !rivalBlob) {
+      this.lockChallengeStartMs = 0;
+      this.lockChallengeRival = null;
+      return false;
+    }
+
+    // Classifier scores are max-normalised per frame (tracking.ts
+    // updateClassifierScores), so *something* always sits at 1.0 — "a rival is
+    // ahead" is therefore true by construction and a margin test alone would
+    // collapse into the absolute confidence gate that v0.3.0 shipped and
+    // v0.3.1 had to revert. What actually distinguishes a genuine mis-lock is
+    // that the SAME rival keeps winning: with a weak classifier the top blob
+    // flickers between candidates and never holds the lead.
+    const rivalPos = { x: rivalBlob.cx, y: rivalBlob.cy };
+    const sameRival = this.lockChallengeRival !== null &&
+      Math.hypot(rivalPos.x - this.lockChallengeRival.x,
+        rivalPos.y - this.lockChallengeRival.y) <= Math.max(6, this.expectedIconDiam);
+    this.lockChallengeRival = rivalPos;
+    if (!sameRival) {
+      this.lockChallengeStartMs = now;
+      return false;
+    }
+    if (this.lockChallengeStartMs === 0) {
+      this.lockChallengeStartMs = now;
+      return false;
+    }
+    if (!shouldAbandonLock(this.lockChallengeStartMs, now)) return false;
+
+    console.warn('[Tracking] Abandoning lock — another icon has scored ' +
+      bestRival.toFixed(2) + ' vs tracked ' + trackedScore.toFixed(2) +
+      ' for over ' + ((now - this.lockChallengeStartMs) / 1000).toFixed(1) + 's' +
+      ' (likely locked onto the wrong champion). Back to SCANNING.');
+    this.state = TrackingState.SCANNING;
+    this.lockChallengeStartMs = 0;
+    this.lockChallengeRival = null;
+    this.holdStartMs = 0;
+    this.scanFrameCount = 0;
+    this.scanStartMs = now;
+    this.lastPixelPos = null;
+    this.classifierScores.clear();
+    this.smoothedClassifierScores.clear();
+    return true;
+  }
+
+  /**
+   * Convert this frame's icons to game coordinates and keep them.
+   *
+   * Every icon — ally AND enemy — is already detected and validated by
+   * filterIconBlobs, and until now every enemy was discarded one line later,
+   * used for nothing but a debug stroke colour. They are what makes
+   * directional audio possible: an icon on our own minimap is information the
+   * game already gave us, so reading it back leaks nothing.
+   *
+   * Our own tracked icon is excluded — it is the listener, not a source.
+   */
+  private cacheIconObservations(
+    iconBlobs: Blob[],
+    region: { x: number; y: number; width: number; height: number },
+  ): void {
+    const out: IconObservation[] = [];
+    for (const b of iconBlobs) {
+      const cx = region.x + b.cx;
+      const cy = region.y + b.cy;
+      if (this.lastPixelPos) {
+        const dx = cx - this.lastPixelPos.x;
+        const dy = cy - this.lastPixelPos.y;
+        const selfRadius = Math.max(4, this.expectedIconDiam * 0.5);
+        if (dx * dx + dy * dy < selfRadius * selfRadius) continue;
+      }
+      out.push({
+        pos: this.pixelToGamePosition(cx, cy, region),
+        side: b.color === 'teal' ? 'ally' : 'enemy',
+      });
+    }
+    this.lastIcons = out;
+  }
+
+  /**
+   * No usable frame this tick — the game is not on screen.
+   *
+   * Ages the position exactly as a frame containing no champions would, so
+   * every downstream staleness rule keeps working, and drops the cached icons
+   * so nothing pans against a position from minutes ago.
+   */
+  private handleBlackout(): void {
+    const now = performance.now();
+    this.lastIcons = [];
+    this.classifierScores.clear();
+    this.smoothedClassifierScores.clear();
+
+    if (this.state === TrackingState.LOCKED) {
+      if (this.holdStartMs === 0) this.holdStartMs = now;
+      if (shouldForceReacquisition(this.holdStartMs, now)) {
+        console.warn('[Tracking] Game hidden for over ' + FORCED_REACQUIRE_HOLD_MS +
+          'ms — dropping the lock');
+        this.state = TrackingState.SCANNING;
+        this.holdStartMs = 0;
+        this.lastPixelPos = null;
+      }
+    }
+    // Restart the warmup so the first frame after the blackout is judged on
+    // fresh evidence rather than whatever was on the desktop.
+    this.scanStartMs = now;
+    this.scanFrameCount = 0;
+  }
+
+  /**
+   * Champion icons visible on the last scanned frame, in game coordinates,
+   * excluding our own. Empty while tracking has no lock, because without our
+   * own position there is nothing to measure direction against.
+   */
+  getLastIcons(): readonly IconObservation[] {
+    return this.state === TrackingState.LOCKED ? this.lastIcons : [];
   }
 
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
@@ -1027,6 +1278,13 @@ export class TrackingService {
     this.velocityX = 0;
     this.velocityY = 0;
     this.lockedTickCount++;
+    // Clear the hold, exactly as finalizeLockedFrame does for the Phase-1 path.
+    // Without this a successful re-acquisition kept counting the OLD hold, so
+    // getHoldDurationSec() stayed above the orchestrator's 2 s gate and
+    // cross-team audio stayed muted on perfectly healthy tracking — and the
+    // stale hold then tripped the 5 s forced re-acquisition, throwing away the
+    // good lock and rolling the dice on a new one.
+    this.holdStartMs = 0;
     console.log('[Tracking] Re-acquired via classifier (cls=' + clsScore.toFixed(2) +
       '): pixel(' + cx + ',' + cy + ')' +
       ' game(' + Math.round(newPos.x) + ',' + Math.round(newPos.y) + ')');

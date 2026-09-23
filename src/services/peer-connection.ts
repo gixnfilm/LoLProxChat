@@ -83,9 +83,14 @@ export class PeerConnection {
   private muted = false;
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private gainNode: GainNode | null = null;
+  private pannerNode: StereoPannerNode | null = null;
+  private reverbSend: GainNode | null = null;
   private graphCtx: AudioContext | null = null;
   private graphDestination: AudioNode | null = null;
+  private graphReverb: AudioNode | null = null;
   private usingGraph = false;
+  private targetPan = 0;
+  private targetReverb = 0;
   // Outer-loop EMA on volume targets so brief CV tracking glitches don't
   // produce audible dropouts. null = first call (snap to value, no smoothing).
   private smoothedVolume: number | null = null;
@@ -180,15 +185,21 @@ export class PeerConnection {
    * track arrives — the nodes are built in `ontrack` (see connectGraph).
    * Passing `null` tears the graph down and reverts to element playback.
    */
-  setPlaybackGraph(ctx: AudioContext | null, destination: AudioNode | null): void {
+  setPlaybackGraph(
+    ctx: AudioContext | null,
+    destination: AudioNode | null,
+    reverb: AudioNode | null = null,
+  ): void {
     if (!ctx || !destination) {
       this.detachGraph();
       return;
     }
-    if (this.graphCtx === ctx && this.graphDestination === destination) return;
+    if (this.graphCtx === ctx && this.graphDestination === destination &&
+        this.graphReverb === reverb) return;
     this.detachGraph();
     this.graphCtx = ctx;
     this.graphDestination = destination;
+    this.graphReverb = reverb;
     this.connectGraph();
   }
 
@@ -199,8 +210,22 @@ export class PeerConnection {
       this.sourceNode = this.graphCtx.createMediaStreamSource(this.remoteStream);
       this.gainNode = this.graphCtx.createGain();
       this.gainNode.gain.value = 0;
+      // Panner sits AFTER the gain so applyGain and MAX_TOTAL_GAIN keep working
+      // untouched, and the master-bus compressor sees the already-panned
+      // signal rather than a centred one it would then squash asymmetrically.
+      this.pannerNode = this.graphCtx.createStereoPanner();
+      this.pannerNode.pan.value = this.targetPan;
       this.sourceNode.connect(this.gainNode);
-      this.gainNode.connect(this.graphDestination);
+      this.gainNode.connect(this.pannerNode);
+      this.pannerNode.connect(this.graphDestination);
+      if (this.graphReverb) {
+        // Fed post-pan so the reverb tail is positioned too, and post-gain so
+        // it follows distance and mute without extra bookkeeping.
+        this.reverbSend = this.graphCtx.createGain();
+        this.reverbSend.gain.value = 0;
+        this.pannerNode.connect(this.reverbSend);
+        this.reverbSend.connect(this.graphReverb);
+      }
       this.usingGraph = true;
       // Hand the level over to the gain node and keep the element permanently
       // silent — belt and braces, because a single audible element here is the
@@ -222,8 +247,42 @@ export class PeerConnection {
   private teardownNodes(): void {
     try { this.sourceNode?.disconnect(); } catch { /* already gone */ }
     try { this.gainNode?.disconnect(); } catch { /* already gone */ }
+    try { this.pannerNode?.disconnect(); } catch { /* already gone */ }
+    try { this.reverbSend?.disconnect(); } catch { /* already gone */ }
     this.sourceNode = null;
     this.gainNode = null;
+    this.pannerNode = null;
+    this.reverbSend = null;
+  }
+
+  /**
+   * Where this voice sits in the stereo field, -1 (left) to +1 (right).
+   * Ramped rather than set, so a peer crossing in front of you glides instead
+   * of snapping — and so a brief mis-attribution never produces a click.
+   */
+  setPan(pan: number): void {
+    const v = Number.isFinite(pan) ? Math.max(-1, Math.min(1, pan)) : 0;
+    this.targetPan = v;
+    if (!this.pannerNode || !this.graphCtx) return;
+    try {
+      this.pannerNode.pan.setTargetAtTime(v, this.graphCtx.currentTime, 0.12);
+    } catch {
+      this.pannerNode.pan.value = v;
+    }
+  }
+
+  /** How much of this voice is sent to the shared environment reverb, 0..1. */
+  setReverbSend(amount: number): void {
+    const v = Number.isFinite(amount) ? Math.max(0, Math.min(1, amount)) : 0;
+    this.targetReverb = v;
+    if (!this.reverbSend || !this.graphCtx) return;
+    try {
+      // Slower than the pan: walking in and out of the river should feel like
+      // a change of room, not a switch being flipped.
+      this.reverbSend.gain.setTargetAtTime(v, this.graphCtx.currentTime, 0.4);
+    } catch {
+      this.reverbSend.gain.value = v;
+    }
   }
 
   private detachGraph(): void {
@@ -231,6 +290,7 @@ export class PeerConnection {
     this.teardownNodes();
     this.graphCtx = null;
     this.graphDestination = null;
+    this.graphReverb = null;
     this.usingGraph = false;
     this.audioElement.muted = this.muted;
     this.applyGain(this.muted ? 0 : this.targetVolume);
@@ -398,6 +458,7 @@ export class PeerConnection {
     this.teardownNodes();
     this.graphCtx = null;
     this.graphDestination = null;
+    this.graphReverb = null;
     this.usingGraph = false;
     this.remoteStream.getTracks().forEach((t) => t.stop());
     this.pc.close();

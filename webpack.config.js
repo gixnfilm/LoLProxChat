@@ -36,7 +36,6 @@ module.exports = {
     }),
     new CopyPlugin({
       patterns: [
-        { from: 'icons', to: 'icons' },
         { from: 'src/background/background.html', to: 'background/' },
         { from: 'src/overlay/overlay.html', to: 'overlay/' },
         { from: 'src/overlay/overlay.css', to: 'overlay/' },
