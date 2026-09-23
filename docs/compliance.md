@@ -23,7 +23,19 @@ LoLProxChat is built to stay within the categories Riot Games explicitly publish
 
 The volume falloff drops to zero at ~1350 game units — roughly a champion's vision range. You only hear enemies who are close enough that the game would already give you visual indicators of their presence (minimap icon when they walk past warded ground, champion model when they enter your vision); they fade in faintly at that edge and grow louder as they approach.
 
-The app does not reveal *where* an enemy is — only that one is somewhere within hearing range. This is strictly less information than Discord voice chat with the same opponent already provides (which has zero distance modulation).
+Volume alone does not reveal *where* an enemy is — only that one is somewhere within hearing range. This is strictly less information than Discord voice chat with the same opponent already provides (which has zero distance modulation).
+
+## Specifically: directional audio (this fork)
+
+Since v0.7.0 a voice is also panned left or right. This section exists because it changes the claim above, and the change deserves to be stated plainly rather than buried.
+
+**Where the direction comes from.** Only from champion icons that are *already visible on your own minimap*, read out of the same screen capture the app has always taken. Nothing is exchanged between clients — an earlier design that would have sent coordinates peer-to-peer was abandoned precisely because it would have handed the enemy team information the game withholds.
+
+**What that means for hidden information.** A player inside fog of war produces no icon, so no direction is derived and the voice plays centred. When a matched icon disappears the binding is dropped in the same tick; no last-known direction is carried forward. The feature therefore re-presents information the screen is already showing, in a different modality — it does not surface anything obfuscated.
+
+**Where ambiguity is resolved.** When two icons could plausibly be the speaker, no direction is produced at all. The app never guesses a position.
+
+**Honest limit of this claim.** The Riot Developer Portal registration (App ID 809090) covers the upstream project's design. Directional audio is an addition made in this fork and was not part of what was registered. The mechanisms are unchanged — same API, same screen capture, no memory access, no injection — but nobody at Riot has reviewed this specific feature.
 
 For the precise threat-modeling around how a modified client *could* extract additional information from the volume side channel, and the server-side quantization + jitter mitigations applied, see [`threat-model.md`](threat-model.md).
 
@@ -36,6 +48,7 @@ LoLProxChat is **registered and approved** on the Riot Developer Portal — **Ap
 - **Korea region restriction.** Riot has restricted LCU-using apps in Korea as of the LCU API policy change. The app does not enforce a region check programmatically — users in Korean regions should not run it.
 - **"Unsupported" endpoint status.** LCU and Live Client Data are officially listed as "unsupported." Riot can change endpoint shapes anytime, which would break the app (but won't ban users).
 - **This is not legal advice.** Nothing here constitutes legal advice or a guarantee against action by Riot. This document describes the design intent and the published rules, not a contract.
+- **Fork status.** This is a fork. Where it adds behaviour the upstream project did not have — currently directional audio — the upstream Riot registration does not speak to it. See the section above.
 
 ## References
 
