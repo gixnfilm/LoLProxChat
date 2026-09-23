@@ -590,6 +590,43 @@ volumeInput.addEventListener('input', () => {
   sendToBackground('updateSettings', { inputVolume: raw / 100 });
 });
 
+const micThresholdInput = document.getElementById('input-mic-threshold') as HTMLInputElement;
+const micThresholdLabel = document.getElementById('mic-threshold-label')!;
+const micMeterFill = document.getElementById('mic-meter-fill')!;
+const micMeterMark = document.getElementById('mic-meter-mark')!;
+
+function drawThresholdMark(value: number): void {
+  micMeterMark.classList.toggle('off', value <= 0);
+  micMeterMark.style.left = value + '%';
+}
+
+registerResync(() => {
+  const stored = Math.round(getAudioPrefs().micThreshold);
+  micThresholdInput.value = String(stored);
+  micThresholdLabel.textContent = String(stored);
+  drawThresholdMark(stored);
+});
+micThresholdInput.addEventListener('input', () => {
+  const raw = Number(micThresholdInput.value);
+  if (!Number.isFinite(raw)) return;
+  const v = Math.max(0, Math.min(100, Math.round(raw)));
+  micThresholdLabel.textContent = String(v);
+  drawThresholdMark(v);
+  pushPrefs({ micThreshold: v });
+});
+
+// The mic level is published by AudioService at 40 Hz. Both windows share one
+// WebView, so this is the same bus the overlay already uses in the other
+// direction (see sendToBackground).
+window.addEventListener('micLevel', ((e: CustomEvent) => {
+  const { level, transmitting } = e.detail as { level: number; transmitting: boolean };
+  micMeterFill.style.width = Math.max(0, Math.min(100, level)) + '%';
+  // Green means "this is going out" — mute, push-to-talk and the gate all
+  // folded into one flag by the audio engine, which is the only place that
+  // knows all three.
+  micMeterFill.classList.toggle('open', transmitting);
+}) as EventListener);
+
 const scanRateInput = document.getElementById('input-scan-rate') as HTMLInputElement;
 const scanRateLabel = document.getElementById('scan-rate-label')!;
 scanRateInput.addEventListener('input', () => {

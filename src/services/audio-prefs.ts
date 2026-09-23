@@ -50,6 +50,9 @@ export interface AudioPrefs {
   audioBoost: boolean;
   /** Pre-transmission mic gain, 0..1. Mirrors AudioSettings.inputVolume. */
   inputVolume: number;
+  /** Voice-gate threshold on the 0..100 meter scale. 0 disables the gate, so
+   *  Always Open transmits continuously the way it always did. */
+  micThreshold: number;
 }
 
 export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
@@ -62,6 +65,11 @@ export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
   fadeCurve: 0.7,
   audioBoost: true,
   inputVolume: 1.0,
+  // Low on purpose. Browser noise suppression already runs on the mic, so
+  // room tone sits near zero and 10 is enough to stop a keyboard without
+  // clipping the start of a quiet sentence. The meter next to the slider is
+  // there so this can be corrected in seconds rather than guessed at.
+  micThreshold: 10,
 });
 
 function num(raw: unknown, fallback: number, lo: number, hi: number): number {
@@ -119,6 +127,7 @@ export function getAudioPrefs(): AudioPrefs {
       ? stored.audioBoost
       : DEFAULT_AUDIO_PREFS.audioBoost,
     inputVolume: num(stored.inputVolume, DEFAULT_AUDIO_PREFS.inputVolume, 0, 1),
+    micThreshold: num(stored.micThreshold, DEFAULT_AUDIO_PREFS.micThreshold, 0, 100),
   };
 }
 

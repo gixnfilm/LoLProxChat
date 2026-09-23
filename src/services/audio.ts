@@ -7,6 +7,7 @@ import {
   curveFor, groupGainFor,
 } from './audio-prefs';
 import { resolvePeerLevel, computeFinalPeerVolume, TickSample } from './proximity-curve';
+import { levelPercent, updateGate, GateState, CLOSED_GATE } from './mic-gate';
 
 export { computeFinalPeerVolume };
 
@@ -25,6 +26,12 @@ function peakRms(buf: Float32Array): number {
 // response before letting it fall away. Covers a dropped coords packet or two
 // on a lossy / DPI-bypass connection so the audio doesn't blip and back (#27).
 const PROXIMITY_GRACE_MS = 1500;
+
+/** How often the voice gate re-reads the mic level. Also its attack time. */
+const GATE_INTERVAL_MS = 25;
+
+/** How long the gate stays open after the level drops. See updateGate. */
+const GATE_HOLD_MS = 300;
 
 // How long a teammate keeps their last level on ticks that never reached the
 // server at all (our own tracking lost us). Longer than the grace window on
@@ -101,6 +108,7 @@ export class AudioService {
   private playbackBus: GainNode | null = null;
   private playbackCompressor: DynamicsCompressorNode | null = null;
   private gainNode: GainNode | null = null;
+  private gateNode: GainNode | null = null;
   private outputStream: MediaStream | null = null;
   // Held so we can swap it when the user picks a different input device at
   // runtime without renegotiating WebRTC (the destination MediaStream that
@@ -226,8 +234,15 @@ export class AudioService {
     // Simple straight-through chain: mic → gain → destination. Noise
     // suppression is handled by the browser's native DSP (set via the
     // getUserMedia constraints above) which runs off the JS main thread.
+    // mic → volume → gate → WebRTC. The gate is a separate node rather than a
+    // second writer on the volume gain: two things multiplying into one
+    // AudioParam means whichever wrote last wins, and a slider drag would
+    // cancel an in-flight gate ramp (or vice versa).
+    this.gateNode = this.audioContext.createGain();
+    this.gateNode.gain.value = 1;
     this.micSource.connect(this.gainNode);
-    this.gainNode.connect(destination);
+    this.gainNode.connect(this.gateNode);
+    this.gateNode.connect(destination);
     console.log('[Audio] Using native browser noise suppression');
 
     this.outputStream = destination.stream;
@@ -243,6 +258,9 @@ export class AudioService {
   private micLevelAnalyser: AnalyserNode | null = null;
   private outputLevelAnalyser: AnalyserNode | null = null;
   private levelMonitorId: number | null = null;
+  private gateId: number | null = null;
+  private gate: GateState = CLOSED_GATE;
+  private lastGateOpen: boolean | null = null;
 
   private startAudioLevelMonitor(
     micSource: MediaStreamAudioSourceNode,
@@ -263,6 +281,8 @@ export class AudioService {
     const micBuf = new Float32Array(this.micLevelAnalyser.fftSize);
     const outBuf = new Float32Array(this.outputLevelAnalyser.fftSize);
 
+    this.startMicGate();
+
     this.levelMonitorId = window.setInterval(() => {
       if (!this.micLevelAnalyser || !this.outputLevelAnalyser) return;
       this.micLevelAnalyser.getFloatTimeDomainData(micBuf);
@@ -278,6 +298,64 @@ export class AudioService {
         ' selfMuted=' + this.selfMuted,
       );
     }, 2000) as unknown as number;
+  }
+
+  /**
+   * Run the voice gate and publish the mic level to the overlay meter.
+   *
+   * 40 Hz, because the interval *is* the attack time: a slower loop clips the
+   * first syllable of every sentence, which is the thing that makes a gate
+   * feel broken. Reading 1024 samples 40 times a second is nothing next to the
+   * per-frame computer vision already running on this thread.
+   */
+  private startMicGate(): void {
+    if (!this.micLevelAnalyser) return;
+    const buf = new Float32Array(this.micLevelAnalyser.fftSize);
+    this.gateId = window.setInterval(() => {
+      if (!this.micLevelAnalyser) return;
+      this.micLevelAnalyser.getFloatTimeDomainData(buf);
+      const level = levelPercent(peakRms(buf));
+
+      // Push-to-talk and self-mute already gate the track outright; layering a
+      // second gate on top would only add a way for them to disagree.
+      const gated = this.settings.inputMode !== 'ptt' && !this.selfMuted;
+      const threshold = gated ? this.prefs.micThreshold : 0;
+      this.gate = updateGate(this.gate, level, threshold, performance.now(), GATE_HOLD_MS);
+      this.applyGateGain(this.gate.open);
+
+      // One boolean, decided here. Letting the overlay combine mute + PTT +
+      // gate itself would be a second copy of the rule, and a meter that says
+      // "you are being heard" while you are muted is worse than no meter.
+      const transmitting = !this.selfMuted && this.isTransmitting() &&
+        (!gated || this.gate.open);
+      window.dispatchEvent(new CustomEvent('micLevel', {
+        detail: { level, transmitting },
+      }));
+    }, GATE_INTERVAL_MS) as unknown as number;
+  }
+
+  /**
+   * Fade the gate rather than switching it, and fade in faster than out.
+   *
+   * A hard 0/1 write clicks audibly — a step in a waveform is a broadband
+   * transient, which is why noise gates have attack and release controls at
+   * all. Opening is quick so nothing is lost off the front of a word; closing
+   * is gentler because the hold has already decided the speech is over.
+   */
+  private applyGateGain(open: boolean): void {
+    if (!this.gateNode) return;
+    if (open === this.lastGateOpen) return;
+    this.lastGateOpen = open;
+    const ctx = this.audioContext;
+    if (ctx) {
+      try {
+        this.gateNode.gain.setTargetAtTime(
+          open ? 1 : 0, ctx.currentTime, open ? 0.008 : 0.05,
+        );
+        return;
+      } catch { /* fall through to a direct write */ }
+    }
+    this.gateNode.gain.value = open ? 1 : 0;
   }
 
   private isTransmitting(): boolean {
@@ -475,7 +553,12 @@ export class AudioService {
    */
   applyAudioPrefs(prefs: AudioPrefs): void {
     const boostChanged = prefs.audioBoost !== this.prefs.audioBoost;
+    const thresholdChanged = prefs.micThreshold !== this.prefs.micThreshold;
     this.prefs = prefs;
+    // Lowering the threshold below a currently-quiet level should open the
+    // gate now, not on the next syllable — otherwise dragging the slider
+    // appears to do nothing until you speak again.
+    if (thresholdChanged) this.gate = CLOSED_GATE;
     this.settings.inputVolume = prefs.inputVolume;
     this.applyInputVolume();
 
@@ -809,6 +892,12 @@ export class AudioService {
       this.localStream = newStream;
       this.micSource = this.audioContext.createMediaStreamSource(newStream);
       this.micSource.connect(this.gainNode);
+      // disconnect() above cut the level analyser loose along with everything
+      // else, and nothing reconnected it — the mic= figure in the log has been
+      // reading a flat 0.000 after every device switch. Harmless while it was
+      // only a log line; now the voice gate reads the same number and would
+      // stay shut for the rest of the game.
+      if (this.micLevelAnalyser) this.micSource.connect(this.micLevelAnalyser);
       this.updateLocalTrackState();
       console.log('[Audio] Input device switched');
     } catch (e) {
@@ -829,6 +918,16 @@ export class AudioService {
     this.outputStream = null;
     this.localStream?.getTracks().forEach((t) => t.stop());
     this.localStream = null;
+    // A new AudioService is built per game, so an interval that outlives
+    // cleanup() is not a one-off leak: after five games five gate loops run at
+    // once, each reading a dead analyser and each firing micLevel events at
+    // the overlay meter.
+    if (this.levelMonitorId !== null) window.clearInterval(this.levelMonitorId);
+    if (this.gateId !== null) window.clearInterval(this.gateId);
+    this.levelMonitorId = null;
+    this.gateId = null;
+    this.micLevelAnalyser = null;
+    this.outputLevelAnalyser = null;
     this.audioContext?.close();
     this.audioContext = null;
     this.teardownPlaybackGraph();

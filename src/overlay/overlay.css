@@ -221,6 +221,41 @@ html, body {
 }
 .setting-row input[type="range"]::-webkit-slider-thumb:hover { background: #cdcdcd; }
 
+/* Live mic level, directly under the threshold slider.
+   A threshold without a meter is guesswork: you cannot see that your keyboard
+   peaks at 8 and your voice at 40, so you cannot pick a number between them.
+   With the bar it takes seconds. */
+.mic-meter {
+  position: relative;
+  height: 6px;
+  margin: 0 0 6px;
+  background: rgba(100, 120, 160, 0.18);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.mic-meter-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background: #5a6480;
+  border-radius: 3px;
+  /* Fast enough to feel live, slow enough not to strobe at 40 Hz. */
+  transition: width 60ms linear, background-color 90ms linear;
+}
+.mic-meter-fill.open { background: #4ade80; }
+.mic-meter-mark {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  margin-left: -1px;
+  background: #cdcdcd;
+  border-radius: 1px;
+}
+.mic-meter-mark.off { display: none; }
+
 .player-list::-webkit-scrollbar { width: 4px; }
 .player-list::-webkit-scrollbar-track { background: transparent; }
 .player-list::-webkit-scrollbar-thumb { background: rgba(100, 120, 160, 0.3); border-radius: 2px; }

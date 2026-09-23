@@ -22,13 +22,46 @@ Back to basics: hear people who are near you, don't hear people who aren't.
 The settings panel is now just devices, mic, three volumes, proximity, and the
 debug tools.
 
-### Note on what is still broken
-Reliability is **not** fixed by this release. Measured from a real session log:
-the minimap tracker knew your position in only 43% of ticks, forced 22 full
-re-acquisitions, and repeatedly locked onto a teammate's icon instead of yours —
-at which point every distance is computed from the wrong place. Three concrete
-causes are identified and queued; this release only removes what was sitting on
-top of them.
+### Added
+- **Mic Threshold**, with a live level bar under the slider. Always Open used
+  to transmit continuously — there was no speech detection in the app at all,
+  only "on" and "push to talk", so your keyboard went out to everyone. Set the
+  marker above where typing peaks and below where your voice sits. **0 turns it
+  off** and behaves exactly like before; Push to Talk ignores it entirely.
+
+### Fixed — tracking reliability
+Measured from a real session log, the minimap tracker knew your position in only
+43% of ticks, forced 22 full re-acquisitions, and repeatedly locked onto a
+teammate's icon instead of yours — at which point every distance is computed
+from the wrong place. Four causes, all addressed here:
+
+- **The champion classifier invented certainty out of noise.** Its confidence
+  bar sat at 0.005, below the 1/173 a 173-class model outputs when it knows
+  nothing. Noise cleared it, per-frame normalisation rescaled the luckiest blob
+  to a confident-looking 1.00, and the tracked position teleported 8521 units
+  across the map one second after the model loaded. The bar now sits clearly
+  above chance, and a classifier that is returning nothing useful no longer
+  counts as a classifier.
+- **One line blocked all tracking.** Candidates were rejected outright on
+  classifier confidence — so when the classifier returned zero for everything,
+  which is the normal case on 32-pixel minimap crops, *every* candidate was
+  rejected on *every* tick. The lock could never be followed, and the tracker
+  forced a full re-acquisition every five seconds.
+- **Icon detection dropped most champions.** The fill-ratio limit was measured
+  on the thin ring but applied after the ring is thickened, so slightly thicker
+  icons failed a test they were never measured against. Widened, along with the
+  size window.
+- **The camera box is now used to tell which icon is you.** League draws a
+  bright rectangle on the minimap showing where you are looking; with the camera
+  locked to your champion its centre *is* you. It was already being detected —
+  only to be excluded from a scoring term, with the geometry thrown away. It now
+  decides which teal ring is yours, and when no icon is trustworthy at all, its
+  centre serves as the position outright.
+- **Losing your position no longer means everyone gets loud.** Before the first
+  fix of a game you are all in the fountain, so everyone is audible. After that,
+  losing track is treated as losing track: the last level is held briefly, then
+  fades. With tracking failing over half the time, the old rule was heard as
+  "I hear my team wherever I am".
 
 
 ## [v0.7.2] — 2026-09-23

@@ -56,6 +56,17 @@
           <span id="volume-label" class="setting-value-label">100</span>
         </div>
       </div>
+      <div class="setting-row">
+        <label title="How loud you have to be before anything is sent. Watch the bar below: set the marker above where typing peaks and below where your voice sits. 0 turns it off and transmits everything. Push to Talk ignores this.">Mic Threshold</label>
+        <div class="setting-value-group">
+          <input id="input-mic-threshold" type="range" min="0" max="100" value="10">
+          <span id="mic-threshold-label" class="setting-value-label">10</span>
+        </div>
+      </div>
+      <div class="mic-meter" id="mic-meter" title="Your current mic level. Green means you are being transmitted.">
+        <div class="mic-meter-fill" id="mic-meter-fill"></div>
+        <div class="mic-meter-mark" id="mic-meter-mark"></div>
+      </div>
       <div class="settings-heading">Voice Mixer</div>
       <div class="setting-row">
         <label title="Output level for every voice, 0-200%. Above 100% amplifies past the original recording.">Master Vol</label>
@@ -105,7 +116,7 @@
         <button id="btn-audio-boost" class="icon-btn">ON</button>
       </div>
       <div class="setting-row">
-        <label title="Restore every setting to its factory default: mixer, mic volume, per-player sliders, key bindings, devices, Hide IP and auto-update. Click twice to confirm.">Reset All</label>
+        <label title="Restore every setting to its factory default: mixer, mic volume, mic threshold, per-player sliders, key bindings, devices and auto-update. Click twice to confirm.">Reset All</label>
         <button id="btn-reset-all" class="icon-btn">RESET</button>
       </div>
       <div id="scan-rate-row" class="setting-row hidden">
