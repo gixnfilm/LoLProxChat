@@ -1179,17 +1179,29 @@ export class TrackingService {
     const holdSec = this.holdStartMs > 0 ? (now - this.holdStartMs) / 1000 : 0;
     const maxJumpPx = computeMaxJumpPx(this.expectedIconDiam, this.holdStartMs, now);
 
+    // The camera box only speaks for us while the camera is actually on us.
+    // Someone scrolling the map to look at another lane moves the box across
+    // the minimap while their champion stands still, and a box parked over a
+    // teammate would hand that teammate a quarter of the follow score. So it
+    // is used here only while it agrees with where we already think we are —
+    // in SCANNING there is no position to disagree with, which is why the
+    // fallback there is unconditional.
+    const trustedViewport = this.viewportCenter &&
+      Math.hypot(this.viewportCenter.x - lastReg.x, this.viewportCenter.y - lastReg.y)
+        <= Math.max(12, this.expectedIconDiam * 3)
+      ? this.viewportCenter
+      : null;
+
     const scoreFns: ScoreFns = {
       cls: (b) => this.getClassifierScore(b),
-      // Where the camera box exists, prefer blobs near it over blobs merely
-      // near where we last were — that is what stops a lock drifting onto a
-      // teammate who walked past.
+      // Where the camera box is trustworthy, prefer blobs near it over blobs
+      // merely near where we last were — that is what stops a lock drifting
+      // onto a teammate who walked past.
       white: (b) => {
-        const vp = this.viewportCenter;
-        if (!vp) {
+        if (!trustedViewport) {
           return this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height);
         }
-        return Math.max(0, 1 - Math.hypot(b.cx - vp.x, b.cy - vp.y) /
+        return Math.max(0, 1 - Math.hypot(b.cx - trustedViewport.x, b.cy - trustedViewport.y) /
           Math.max(8, this.expectedIconDiam * 2.5));
       },
       peer: (b) => this.peerAvoidanceScore(b),
