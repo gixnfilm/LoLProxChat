@@ -138,20 +138,24 @@ function allyOutOfRangeLevel(curve: ProximityCurve | null): number {
 /**
  * What a teammate should sound like when we have no idea where *we* are.
  *
- * Always full volume, never the out-of-range level — and the distinction is
- * the whole point. A teammate missing from the server's response is *evidence*
- * of distance: the server looked, and they were too far. A tick that never
- * reached the server is the *absence* of evidence, and the missing piece is
- * our own position, not theirs.
+ * This depends on whether we have *ever* had a position this game, and getting
+ * that distinction wrong has now caused both possible complaints:
  *
- * Conflating the two silenced entire teams. With the out-of-range level set to
- * silence, every game began with nobody able to hear anyone: tracking is still
- * scanning in the fountain, so every tick is a no-data tick, so everyone was
- * treated as too far away. The same applied after every death and every
- * tracking hiccup.
+ *   • Treating it as "full volume" always — every game starts with tracking
+ *     still scanning in the fountain, and a tracker that loses the player mid
+ *     game goes right back there. With tracking failing over half the time, the
+ *     result is teammates at full volume most of the match, which is exactly
+ *     the "I hear them worldwide" report.
+ *   • Treating it as "out of range" always — at the start of a game nobody can
+ *     hear anyone, because no position exists yet.
+ *
+ * So: before the first fix of the game you are all standing in the fountain and
+ * everyone is audible. After that, losing the position means losing it — hold
+ * briefly, then fall to the out-of-range level rather than jumping back to full
+ * volume.
  */
-function allyUnknownLevel(): number {
-  return 1;
+function allyUnknownLevel(everTracked: boolean, curve: ProximityCurve | null): number {
+  return everTracked ? allyOutOfRangeLevel(curve) : 1;
 }
 
 export interface PeerLevelInput {
@@ -167,6 +171,8 @@ export interface PeerLevelInput {
   graceMs: number;
   /** How long to hold when the tick itself had no server data (allies only). */
   allyHoldMs: number;
+  /** Whether any position has been established at all this game. */
+  everTracked: boolean;
 }
 
 /**
@@ -186,7 +192,7 @@ export interface PeerLevelInput {
  * allies see each other on the minimap regardless.
  */
 export function resolvePeerLevel(input: PeerLevelInput): number {
-  const { tick, isAlly, curve, lastLevel, msSinceSeen, graceMs, allyHoldMs } = input;
+  const { tick, isAlly, curve, lastLevel, msSinceSeen, graceMs, allyHoldMs, everTracked } = input;
 
   if (tick.kind === 'server') {
     return shapeProximity(tick.vol, curve);
@@ -213,7 +219,7 @@ export function resolvePeerLevel(input: PeerLevelInput): number {
   // the whole team every time tracking hiccups (which happens on every death).
   const holdable = msSinceSeen === undefined || msSinceSeen <= allyHoldMs;
   if (holdable && lastLevel !== undefined) return lastLevel;
-  return allyUnknownLevel();
+  return allyUnknownLevel(everTracked, curve);
 }
 
 /**

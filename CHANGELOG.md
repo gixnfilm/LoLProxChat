@@ -4,6 +4,33 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.8.0] — 2026-09-23
+
+Back to basics: hear people who are near you, don't hear people who aren't.
+
+### Removed
+- **Stereo positioning** and **river reverb**. They worked, but they rest on
+  knowing your own position — and that is exactly the part that is currently
+  unreliable, so a wrong position pointed the sound at the wrong person. The
+  code is kept in git history and can come back once the foundation is solid.
+- **Hide IP (Force TURN)** is no longer a setting. It is now always on:
+  without the relay every other player in the match, including strangers on the
+  enemy team, learns your real IP from the connection handshake. Relaying also
+  sidesteps the network setups where a direct connection never establishes at
+  all. It costs 20-100 ms, which is not noticeable for speech.
+
+The settings panel is now just devices, mic, three volumes, proximity, and the
+debug tools.
+
+### Note on what is still broken
+Reliability is **not** fixed by this release. Measured from a real session log:
+the minimap tracker knew your position in only 43% of ticks, forced 22 full
+re-acquisitions, and repeatedly locked onto a teammate's icon instead of yours —
+at which point every distance is computed from the wrong place. Three concrete
+causes are identified and queued; this release only removes what was sitting on
+top of them.
+
+
 ## [v0.7.2] — 2026-09-23
 
 Two bugs introduced in v0.7.0/v0.7.1, both of which made the app worse than the
@@ -602,6 +629,7 @@ falloff is configurable instead of fixed.
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.8.0]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.8.0
 [v0.7.2]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.2
 [v0.7.1]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.1
 [v0.7.0]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.0

@@ -62,6 +62,10 @@ export class AudioService {
   // 1.00 — the fingerprint of a server that ignores allyProximity.
   private allyFlatOneTicks = 0;
   private allyProximityWarned = false;
+  // Whether this game has ever produced a usable position. Before it has,
+  // everyone is still in the fountain and should hear each other; afterwards,
+  // losing the position means losing it. See allyUnknownLevel.
+  private everTracked = false;
   // Throttling state for the verbose applyPeerVolumes snapshot log
   private lastVolumeLogLine = '';
   private lastVolumeLogMs = 0;
@@ -532,6 +536,7 @@ export class AudioService {
       msSinceSeen: st?.seenAtMs === undefined ? undefined : now - st.seenAtMs,
       graceMs: PROXIMITY_GRACE_MS,
       allyHoldMs: ALLY_NO_DATA_HOLD_MS,
+      everTracked: this.everTracked,
     });
     const next: PeerVolumeState = { ...(st ?? {}), lastLevel: shaped };
     this.peerVolumeState.set(name, next);
@@ -568,6 +573,7 @@ export class AudioService {
     const clean: Record<string, number> = Object.fromEntries(entries);
 
     if (fresh) {
+      this.everTracked = true;
       // Only a real response updates "when did we last hear about this peer"
       // and the raw server value. Both feed the grace window and the prefs
       // replay, and both must reflect the server, not us.

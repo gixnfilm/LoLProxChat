@@ -98,6 +98,13 @@ export function pickBestBlobInRange(
     const posScore = 1 - (dxPred * dxPred + dyPred * dyPred) / maxJumpSq;
 
     const clsScore = scoreFns.cls(b);
+    // Skipping a candidate outright on classifier confidence is only safe
+    // while the classifier is informative. When it returns zero for everything
+    // — the normal case on real minimap crops — this rejected every blob on
+    // every tick, so a lock could never be followed, the hold grew, and the
+    // tracker forced a full re-acquisition every five seconds. The caller now
+    // passes hasClassifier=false in that situation, which disables this gate
+    // and switches computeBlobScore to the weights that do not depend on it.
     if (hasClassifier && clsScore < CLS_FOLLOW_THRESHOLD) continue;
 
     const score = computeBlobScore(

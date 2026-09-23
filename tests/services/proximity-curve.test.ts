@@ -39,6 +39,7 @@ const base = {
   msSinceSeen: undefined as number | undefined,
   graceMs: 1500,
   allyHoldMs: 5000,
+  everTracked: true,
 };
 const SERVER = (vol: number): TickSample => ({ kind: 'server', vol });
 const ABSENT: TickSample = { kind: 'absent' };
@@ -226,31 +227,53 @@ describe('resolvePeerLevel — teammates stay reachable', () => {
     })).toBe(0.62);
   });
 
-  test('a long no-data stretch settles on full volume, not the out-of-range level', () => {
-    // These two used to assert the floor, and that assertion encoded a bug.
-    // Once the floor became silence, "we do not know where we are" silenced the
-    // entire team — which is the state every game starts in, because tracking
-    // is still scanning while everyone is in the fountain.
+  test('before the first fix of the game, a teammate is audible', () => {
+    // Every game starts with tracking still scanning while everyone stands in
+    // the fountain. Treating that as "too far away" silenced entire teams.
     expect(resolvePeerLevel({
-      ...base, tick: NO_DATA, isAlly: true, lastLevel: 0.62, msSinceSeen: 9000,
+      ...base, everTracked: false, tick: NO_DATA, isAlly: true,
+    })).toBe(1);
+    expect(resolvePeerLevel({
+      ...base, everTracked: false, tick: NO_DATA, isAlly: true,
+      lastLevel: 0.3, msSinceSeen: 9000,
     })).toBe(1);
   });
 
-  test('no history on a no-data tick → full volume', () => {
+  test('after a position has existed, losing it does NOT jump back to full volume', () => {
+    // The other half of the same mistake: with tracking failing over half the
+    // time, "no position means full volume" is heard as "teammates are audible
+    // wherever I am", which is what proximity chat exists to avoid.
     expect(resolvePeerLevel({
-      ...base, tick: NO_DATA, isAlly: true,
-    })).toBe(1);
+      ...base, everTracked: true, tick: NO_DATA, isAlly: true,
+      lastLevel: 0.62, msSinceSeen: 9000,
+    })).toBe(CURVE.floor);
+    expect(resolvePeerLevel({
+      ...base, everTracked: true, tick: NO_DATA, isAlly: true,
+    })).toBe(CURVE.floor);
+  });
+
+  test('a brief gap is still held, whether or not we have tracked before', () => {
+    for (const everTracked of [true, false]) {
+      expect(resolvePeerLevel({
+        ...base, everTracked, tick: NO_DATA, isAlly: true,
+        lastLevel: 0.62, msSinceSeen: 2000,
+      })).toBe(0.62);
+    }
   });
 
   test('a silent floor still silences a teammate the server says is out of range', () => {
     // The distinction that matters: absence from a response is evidence of
     // distance, a tick that never reached the server is absence of evidence.
+    // The second half only holds before the first fix of the game — once a
+    // position has existed, losing it is treated as a loss, not as a blank
+    // slate. See allyUnknownLevel.
     const silent = { ...CURVE, floor: 0 };
     expect(resolvePeerLevel({
       ...base, curve: silent, tick: ABSENT, isAlly: true, msSinceSeen: 9000,
     })).toBe(0);
     expect(resolvePeerLevel({
-      ...base, curve: silent, tick: NO_DATA, isAlly: true, msSinceSeen: 9000,
+      ...base, everTracked: false, curve: silent, tick: NO_DATA, isAlly: true,
+      msSinceSeen: 9000,
     })).toBe(1);
   });
 

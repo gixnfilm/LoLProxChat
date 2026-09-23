@@ -26,6 +26,18 @@ import {
  */
 const TICK_STUCK_MS = 4000;
 
+/**
+ * How long the classifier keeps counting as usable after its last informative
+ * pass, so the scoring formula doesn't flip between frames.
+ */
+const CLASSIFIER_GRACE_MS = 3000;
+
+/**
+ * How long to keep looking for a trustworthy icon before falling back to the
+ * camera-box centre as the position.
+ */
+const VIEWPORT_FALLBACK_MS = 2500;
+
 export enum TrackingState {
   SCANNING = 'scanning',
   LOCKED = 'locked',
@@ -111,6 +123,12 @@ export class TrackingService {
   // Region-relative centroid of the blob currently out-scoring the tracked one,
   // so we can tell a persistent challenger from classifier noise.
   private lockChallengeRival: { x: number; y: number } | null = null;
+  // Whether the last classifier pass actually said anything. On this model,
+  // against real minimap crops, it frequently says nothing at all.
+  private classifierInformative = false;
+  private classifierInformativeMs = 0;
+  // Camera-box centre from the last frame, region-relative px, or null.
+  private viewportCenter: { x: number; y: number } | null = null;
   private diagCounter = 0;
 
   constructor(screenWidth: number, screenHeight: number, mapType: MapType) {
@@ -326,9 +344,21 @@ export class TrackingService {
       // Minimum raw threshold: if no blob exceeds this, the model is saying none of them
       // match the local champion — don't inflate via normalization (prevents single wrong
       // blob from getting cls=1.0 just because it's the only one detected).
-      const MIN_RAW_THRESHOLD = 0.005;
+      // A 173-class softmax that knows nothing still outputs ~1/173 = 0.0058
+      // per class, so the old 0.005 bar sat BELOW pure chance. Noise cleared
+      // it, normalisation then rescaled the luckiest blob to exactly 1.0, and
+      // a confident-looking 1.0 is all pickClassifierReacquisition needs to
+      // teleport the tracked position across the map. A real session log shows
+      // precisely that, one second after the model loaded:
+      //   WARN: position jumped 8521 units in 0.26s ... (1305,1409)->(6946,7795)
+      //   Re-acquired via classifier (cls=1.00)
+      // The bar now sits clearly above chance.
+      const MIN_RAW_THRESHOLD = 0.02;
       const maxRaw = Math.max(...rawScores);
-      const normalizedScores = maxRaw >= MIN_RAW_THRESHOLD
+      const informative = maxRaw >= MIN_RAW_THRESHOLD;
+      this.classifierInformative = informative;
+      this.classifierInformativeMs = informative ? performance.now() : this.classifierInformativeMs;
+      const normalizedScores = informative
         ? rawScores.map(s => s / maxRaw)
         : rawScores.map(() => 0);
 
@@ -578,8 +608,13 @@ export class TrackingService {
     const diam = this.expectedIconDiam;
     if (diam < 5) return blobs;
 
-    const minSize = diam * 0.6;
-    const maxSize = diam * 1.6;
+    // Widened from 0.6-1.6. The expected diameter is derived from a formula
+    // over League's HUD scale with no verification that it matches what is
+    // actually on screen, so a mis-estimate silently rejects every real icon.
+    // Extra false positives are cheap now that the camera box does the
+    // identifying; missing the true icon is not.
+    const minSize = diam * 0.5;
+    const maxSize = diam * 2.0;
 
     return blobs.filter(b => {
       const bw = b.maxX - b.minX + 1;
@@ -595,7 +630,12 @@ export class TrackingService {
       // Towers and minion clusters are FILLED shapes → high fill ratio
       // Ring of diameter D, border ~3px: fillRatio ≈ 0.25-0.35
       // Minion groups: fillRatio > 0.40 (many pixels clumped together)
-      if (b.fillRatio > 0.40) return false;
+      // The 0.40 ceiling was written for the UNDILATED ring (comment above),
+      // but the filter runs after dilate(), which thickens the band on both
+      // sides and pushes fillRatio up by roughly 0.10-0.14. A ring with a
+      // slightly thicker border therefore failed a test it was never measured
+      // against. Raised to match where the filter actually runs.
+      if (b.fillRatio > 0.55) return false;
       // Too sparse means noise, not a real border
       if (b.fillRatio < 0.08) return false;
       return true;
@@ -673,6 +713,7 @@ export class TrackingService {
     }
 
     this.viewportMask = viewportMask;
+    this.viewportCenter = this.computeViewportCenter(viewportMask, w, h);
     return { whiteMask, viewportMask };
   }
 
@@ -948,7 +989,7 @@ export class TrackingService {
 
     // Wait ~1s for classifier EMA to stabilize (~0.5s without classifier),
     // independent of scan rate.
-    const hasClassifier = !!(this.classifier && this.classifier.isLoaded());
+    const hasClassifier = this.classifierUsable();
     const warmupMs = hasClassifier ? 1000 : 500;
     if (performance.now() - this.scanStartMs < warmupMs) {
       if (this.onPositionUpdate && this.lastPosition) {
@@ -956,6 +997,8 @@ export class TrackingService {
       }
       return;
     }
+
+    const viewport = this.viewportCenter;
 
     let bestBlob = tealBlobs[0];
     let bestScore = -Infinity;
@@ -965,10 +1008,23 @@ export class TrackingService {
       const whiteScore = this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height);
       const clsScore = this.getClassifierScore(b);
       const ringScore = Math.min(1, b.pixels * (1 - b.fillRatio) / 200);
+      const viewportScore = viewport
+        ? Math.max(0, 1 - Math.hypot(b.cx - viewport.x, b.cy - viewport.y) /
+            Math.max(8, this.expectedIconDiam * 2.5))
+        : 0;
 
-      const score = hasClassifier
-        ? clsScore * 0.45 + whiteScore * 0.25 + peerScore * 0.20 + ringScore * 0.10
-        : peerScore * 0.40 + whiteScore * 0.35 + ringScore * 0.25;
+      // When the camera box is available it dominates, because it is the only
+      // signal here that actually distinguishes *you* from a teammate. What it
+      // replaced was, in practice, "0.30 + 0.25 × a count of stray white
+      // pixels" — the classifier contributed a constant zero, peer avoidance is
+      // inert, and the ring term saturates for every real icon. Every candidate
+      // therefore scored 0.43-0.55 and the choice between two teammates was a
+      // coin flip.
+      const score = viewport
+        ? viewportScore * 0.60 + clsScore * 0.20 + whiteScore * 0.10 + ringScore * 0.10
+        : hasClassifier
+          ? clsScore * 0.45 + whiteScore * 0.25 + peerScore * 0.20 + ringScore * 0.10
+          : peerScore * 0.40 + whiteScore * 0.35 + ringScore * 0.25;
 
       if (score > bestScore) {
         bestScore = score;
@@ -983,6 +1039,16 @@ export class TrackingService {
     // lockScoreThreshold for the log evidence — eleven consecutive locks at
     // 0.23-0.29 onto blobs the classifier scored 0.000, each one permanent.
     const threshold = lockScoreThreshold(performance.now() - this.scanStartMs);
+    if (bestScore < threshold && viewport &&
+        performance.now() - this.scanStartMs > VIEWPORT_FALLBACK_MS) {
+      // No ring we trust, but we do know where the camera is looking. With a
+      // locked camera that is within ~50 units of the champion, and even an
+      // unlocked one is usually a few hundred — against a hearing radius of
+      // 1350 that is entirely usable. Far better than reporting nothing, which
+      // is what happened for 57% of ticks in the logged session.
+      this.lockOnViewport(viewport, region);
+      return;
+    }
     if (bestScore < threshold) {
       if (this.scanFrameCount % 30 === 0) {
         console.log('[Tracking] Holding off lock: best score ' + bestScore.toFixed(2) +
@@ -994,6 +1060,38 @@ export class TrackingService {
       return;
     }
     this.lockOnBlob(bestBlob, 'composite(score=' + bestScore.toFixed(2) + ')');
+  }
+
+  /**
+   * Adopt the camera-box centre as our position when no icon is trustworthy.
+   *
+   * Deliberately a last resort, after VIEWPORT_FALLBACK_MS of finding nothing:
+   * a real icon is more precise, and with an unlocked camera the box can be
+   * looking somewhere else entirely. But "roughly right" beats "nothing", and
+   * the next tick's Phase 1 will happily snap to a real ring near here.
+   */
+  private lockOnViewport(
+    center: { x: number; y: number },
+    region: { x: number; y: number; width: number; height: number },
+  ): void {
+    const cx = region.x + Math.round(center.x);
+    const cy = region.y + Math.round(center.y);
+    this.lastPixelPos = { x: cx, y: cy };
+    this.setLastPosition(this.pixelToGamePosition(cx, cy, region), 'viewport-fallback');
+    this.state = TrackingState.LOCKED;
+    this.lockedTickCount = 0;
+    this.lockChallengeStartMs = 0;
+    this.scanFrameCount = 0;
+    this.scanStartMs = performance.now();
+    this.holdStartMs = 0;
+    this.lastMovementMs = performance.now();
+    this.velocityX = 0;
+    this.velocityY = 0;
+    console.log('[Tracking] SCANNING -> LOCKED via camera box at (' + cx + ',' + cy + ')' +
+      ' — no icon cleared the confidence bar');
+    if (this.onPositionUpdate && this.lastPosition) {
+      this.onPositionUpdate(this.lastPosition);
+    }
   }
 
   /** Lock onto a teal blob as the local player */
@@ -1059,7 +1157,7 @@ export class TrackingService {
     }
 
     const tealBlobs = iconBlobs.filter(b => b.color === 'teal');
-    const hasClassifier = !!(this.classifier && this.classifier.isLoaded());
+    const hasClassifier = this.classifierUsable();
 
     // No teal blobs at all — extrapolate position using decaying velocity
     if (tealBlobs.length === 0) {
@@ -1083,7 +1181,17 @@ export class TrackingService {
 
     const scoreFns: ScoreFns = {
       cls: (b) => this.getClassifierScore(b),
-      white: (b) => this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height),
+      // Where the camera box exists, prefer blobs near it over blobs merely
+      // near where we last were — that is what stops a lock drifting onto a
+      // teammate who walked past.
+      white: (b) => {
+        const vp = this.viewportCenter;
+        if (!vp) {
+          return this.whitePixelScore(b, whiteMask, viewportMask, region.width, region.height);
+        }
+        return Math.max(0, 1 - Math.hypot(b.cx - vp.x, b.cy - vp.y) /
+          Math.max(8, this.expectedIconDiam * 2.5));
+      },
       peer: (b) => this.peerAvoidanceScore(b),
     };
 
@@ -1217,6 +1325,70 @@ export class TrackingService {
     // fresh evidence rather than whatever was on the desktop.
     this.scanStartMs = now;
     this.scanFrameCount = 0;
+  }
+
+  /**
+   * Centre of League's camera box on the minimap, in region-relative pixels.
+   *
+   * The box is the bright rectangle showing which part of the map you are
+   * looking at. With the camera locked to your champion — League's default —
+   * its centre **is** your champion, which makes the entire "which teal ring am
+   * I?" problem disappear. The project's own research ranked this P0 and it was
+   * never built; the runs were already being detected here purely so they could
+   * be *excluded* from the white-pixel score, and the geometry thrown away.
+   *
+   * Returns null unless the shape is plausibly a camera box: it must be a
+   * decent fraction of the minimap, not almost all of it (that would be the
+   * minimap frame itself), and roughly landscape.
+   */
+  private computeViewportCenter(
+    viewportMask: Uint8Array, w: number, h: number,
+  ): { x: number; y: number } | null {
+    let minX = w, minY = h, maxX = -1, maxY = -1, count = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (viewportMask[y * w + x] !== 1) continue;
+        count++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (count < 20 || maxX < 0) return null;
+
+    const bw = maxX - minX + 1;
+    const bh = maxY - minY + 1;
+    // Too small to be the camera box, or so large it is the minimap border.
+    if (bw < w * 0.15 || bh < h * 0.10) return null;
+    if (bw > w * 0.92 && bh > h * 0.92) return null;
+    // The camera box is wider than it is tall.
+    const aspect = bw / bh;
+    if (aspect < 0.9 || aspect > 3.5) return null;
+
+    return { x: minX + bw / 2, y: minY + bh / 2 };
+  }
+
+  /**
+   * Whether the classifier should be allowed to influence anything right now.
+   *
+   * Being *loaded* is not the same as being *useful*. This model scores 0.695
+   * top-1 on clean validation data and, on real 32px minimap crops, routinely
+   * returns nothing usable — the project's own research notes put it as "32px
+   * crops are background-dominated". Treating "loaded" as "trustworthy" had two
+   * concrete costs: 45% of the lock score became a constant zero, capping every
+   * candidate at 0.55; and CLS_FOLLOW_THRESHOLD made pickBestBlobInRange skip
+   * *every* blob, so a lock could never be followed and timed out into a forced
+   * re-acquisition every five seconds.
+   *
+   * A short grace window keeps a briefly-quiet classifier from flapping the
+   * scoring formula between frames.
+   */
+  private classifierUsable(): boolean {
+    if (!this.classifier || !this.classifier.isLoaded()) return false;
+    if (this.classifierInformative) return true;
+    return this.classifierInformativeMs > 0 &&
+      performance.now() - this.classifierInformativeMs < CLASSIFIER_GRACE_MS;
   }
 
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */
