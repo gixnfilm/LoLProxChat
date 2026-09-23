@@ -50,10 +50,6 @@ export interface AudioPrefs {
   audioBoost: boolean;
   /** Pre-transmission mic gain, 0..1. Mirrors AudioSettings.inputVolume. */
   inputVolume: number;
-  /** How hard voices are panned left/right, 0..1.5. 0 = everything centred. */
-  stereoWidth: number;
-  /** Environment reverb (river) for speakers we can see on the minimap. */
-  reverb: boolean;
 }
 
 export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
@@ -66,8 +62,6 @@ export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
   fadeCurve: 0.7,
   audioBoost: true,
   inputVolume: 1.0,
-  stereoWidth: 1.0,
-  reverb: true,
 });
 
 function num(raw: unknown, fallback: number, lo: number, hi: number): number {
@@ -125,8 +119,6 @@ export function getAudioPrefs(): AudioPrefs {
       ? stored.audioBoost
       : DEFAULT_AUDIO_PREFS.audioBoost,
     inputVolume: num(stored.inputVolume, DEFAULT_AUDIO_PREFS.inputVolume, 0, 1),
-    stereoWidth: num(stored.stereoWidth, DEFAULT_AUDIO_PREFS.stereoWidth, 0, 1.5),
-    reverb: typeof stored.reverb === 'boolean' ? stored.reverb : DEFAULT_AUDIO_PREFS.reverb,
   };
 }
 
@@ -185,7 +177,6 @@ export const ALL_STORAGE_KEYS: readonly string[] = [
   LEGACY_ALLY_PROXIMITY_KEY,
   'lolproxchat.inputDeviceId',
   'lolproxchat.outputDeviceId',
-  'lolproxchat.forceTurnRelay',
   'lolproxchat.pttVk',
   'lolproxchat.toggleVk',
   'proxchat.autoUpdate',

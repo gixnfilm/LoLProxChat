@@ -7,8 +7,6 @@ import {
   curveFor, groupGainFor,
 } from './audio-prefs';
 import { resolvePeerLevel, computeFinalPeerVolume, TickSample } from './proximity-curve';
-import { panFor } from './peer-locator';
-import { Position } from '../core/types';
 
 export { computeFinalPeerVolume };
 
@@ -35,37 +33,6 @@ const PROXIMITY_GRACE_MS = 1500;
 // local client into this state, and ducking the whole team on every death is
 // worse than holding a slightly stale level.
 const ALLY_NO_DATA_HOLD_MS = 5000;
-
-/**
- * How much of a voice is sent to the environment reverb when the speaker is
- * standing somewhere reverberant. Deliberately subtle — the ask was "a little
- * reverb in the river", and a positional cue that swamps intelligibility
- * defeats the point of a voice chat.
- */
-const REVERB_SEND = 0.22;
-
-/**
- * A synthetic impulse response: exponentially decaying stereo noise.
- *
- * Generated rather than shipped as a file — a real room recording would be a
- * licensing question and a download, and for a cue this subtle the difference
- * is inaudible. Slight left/right decorrelation keeps the tail from collapsing
- * to the centre and squashing the panning it is supposed to support.
- */
-function buildReverbImpulse(ctx: AudioContext): AudioBuffer {
-  const seconds = 1.2;
-  const rate = ctx.sampleRate;
-  const length = Math.max(1, Math.floor(seconds * rate));
-  const buffer = ctx.createBuffer(2, length, rate);
-  for (let channel = 0; channel < 2; channel++) {
-    const data = buffer.getChannelData(channel);
-    for (let i = 0; i < length; i++) {
-      const decay = Math.pow(1 - i / length, 2.5);
-      data[i] = (Math.random() * 2 - 1) * decay;
-    }
-  }
-  return buffer;
-}
 
 /** Per-peer volume bookkeeping. One entry, so the inputs can't drift apart. */
 interface PeerVolumeState {
@@ -129,13 +96,6 @@ export class AudioService {
   private playbackCtx: AudioContext | null = null;
   private playbackBus: GainNode | null = null;
   private playbackCompressor: DynamicsCompressorNode | null = null;
-  private playbackReverb: ConvolverNode | null = null;
-  private playbackReverbGain: GainNode | null = null;
-  // Where each peer is, when we can see their icon. Absent = play them centred.
-  private peerPositions: Map<string, Position> = new Map();
-  private selfPosition: Position | null = null;
-  // Which peers are standing somewhere reverberant (the river).
-  private peerWet: Set<string> = new Set();
   private gainNode: GainNode | null = null;
   private outputStream: MediaStream | null = null;
   // Held so we can swap it when the user picks a different input device at
@@ -181,11 +141,6 @@ export class AudioService {
       const bus = ctx.createGain();
       bus.gain.value = 1.0;
       const comp = ctx.createDynamicsCompressor();
-      const reverb = ctx.createConvolver();
-      reverb.buffer = buildReverbImpulse(ctx);
-      const reverbGain = ctx.createGain();
-      reverbGain.gain.value = 1.0;
-      reverb.connect(reverbGain);
       comp.threshold.value = -18;
       comp.knee.value = 12;
       comp.ratio.value = 4;
@@ -193,14 +148,9 @@ export class AudioService {
       comp.release.value = 0.25;
       bus.connect(comp);
       comp.connect(ctx.destination);
-      // Wet path rejoins before the compressor so the tail is levelled with
-      // everything else rather than riding on top of it.
-      reverbGain.connect(bus);
       this.playbackCtx = ctx;
       this.playbackBus = bus;
       this.playbackCompressor = comp;
-      this.playbackReverb = reverb;
-      this.playbackReverbGain = reverbGain;
       void this.resumePlaybackContext();
       void this.applyPlaybackSink();
       console.log('[Audio] Playback graph created (boost path active)');
@@ -210,8 +160,6 @@ export class AudioService {
       this.playbackCtx = null;
       this.playbackBus = null;
       this.playbackCompressor = null;
-      this.playbackReverb = null;
-      this.playbackReverbGain = null;
       return null;
     }
   }
@@ -242,34 +190,17 @@ export class AudioService {
   private teardownPlaybackGraph(): void {
     for (const peer of this.peers.values()) peer.setPlaybackGraph(null, null);
     try { this.playbackCompressor?.disconnect(); } catch { /* already gone */ }
-    try { this.playbackReverbGain?.disconnect(); } catch { /* already gone */ }
-    try { this.playbackReverb?.disconnect(); } catch { /* already gone */ }
     try { this.playbackBus?.disconnect(); } catch { /* already gone */ }
     void this.playbackCtx?.close().catch(() => { /* already closed */ });
     this.playbackCtx = null;
     this.playbackBus = null;
     this.playbackCompressor = null;
-    this.playbackReverb = null;
-    this.playbackReverbGain = null;
   }
 
   /** Attach a peer to the boost path if it is enabled. */
   private attachPlayback(peer: PeerConnection): void {
     const bus = this.ensurePlaybackGraph();
-    if (bus && this.playbackCtx) {
-      peer.setPlaybackGraph(this.playbackCtx, bus, this.playbackReverb);
-    }
-  }
-
-  /**
-   * Tell the mixer where everyone is, from the icons visible on our own
-   * minimap. Peers not in the map have no known position and are played
-   * centred and dry — that is the honest answer when we cannot see them.
-   */
-  setPeerPositions(self: Position | null, positions: Map<string, Position>, wet: Set<string>): void {
-    this.selfPosition = self;
-    this.peerPositions = positions;
-    this.peerWet = wet;
+    if (bus && this.playbackCtx) peer.setPlaybackGraph(this.playbackCtx, bus);
   }
 
   async initMicrophone(): Promise<void> {
@@ -606,13 +537,7 @@ export class AudioService {
     this.peerVolumeState.set(name, next);
 
     const finalVol = this.finalFromShaped(name, shaped, isAlly);
-    const peer = this.peers.get(name);
-    peer?.setVolume(finalVol, immediate);
-    if (peer) {
-      const pos = this.peerPositions.get(name);
-      peer.setPan(this.selfPosition ? panFor(this.selfPosition, pos, this.prefs.stereoWidth) : 0);
-      peer.setReverbSend(this.prefs.reverb && pos && this.peerWet.has(name) ? REVERB_SEND : 0);
-    }
+    this.peers.get(name)?.setVolume(finalVol, immediate);
     return finalVol;
   }
 

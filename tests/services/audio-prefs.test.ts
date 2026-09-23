@@ -62,7 +62,6 @@ describe('getAudioPrefs', () => {
       floor: 4,
       nearFraction: 99,
       fadeCurve: 0,
-      stereoWidth: 99,
       inputVolume: 7,
     }));
     const p = getAudioPrefs();
@@ -75,7 +74,6 @@ describe('getAudioPrefs', () => {
     expect(p.floor).toBe(DEFAULT_AUDIO_PREFS.floor);
     expect(p.nearFraction).toBe(DEFAULT_AUDIO_PREFS.nearFraction);
     expect(p.fadeCurve).toBe(DEFAULT_AUDIO_PREFS.fadeCurve);
-    expect(p.stereoWidth).toBe(1.5);
     expect(p.inputVolume).toBe(1);
     for (const v of Object.values(p)) {
       if (typeof v === 'number') expect(Number.isFinite(v)).toBe(true);

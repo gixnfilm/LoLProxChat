@@ -7,9 +7,7 @@ import { TrackingService, TrackingState } from './tracking';
 import { ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
 import { getAllyProximity, getAudioPrefs, AudioPrefs } from './audio-prefs';
-import { PeerState, Position } from '../core/types';
-import { locatePeers, AudiblePeer } from './peer-locator';
-import { isInRiver } from './river-mask';
+import { PeerState } from '../core/types';
 import '../core/window-globals';
 import { isStreamerMode } from '../core/streamer-detect';
 
@@ -42,9 +40,6 @@ export class Orchestrator {
   // the last forced rescan, so the watchdog neither fires early nor loops.
   private lastGoodPositionMs = 0;
   private lastForcedRescanMs = 0;
-  // Where each peer was last confidently seen, so a binding made in a clear
-  // moment survives the crowded frames that follow.
-  private peerPositions: Map<string, Position> = new Map();
   private sessionActive = false;
   private lastOverlayRepositionTime = 0;
   private lastOverlayBounds: { x: number; y: number; w: number; h: number } | null = null;
@@ -191,7 +186,6 @@ export class Orchestrator {
     // forced rescan on a tracker that started milliseconds ago.
     this.lastGoodPositionMs = 0;
     this.lastForcedRescanMs = 0;
-    this.peerPositions = new Map();
 
     // Carry over any mute toggles the user set before/between sessions.
     this.audio.setSelfMuted(this.selfMutedPref);
@@ -381,7 +375,6 @@ export class Orchestrator {
         this.localSummonerName,
         getAllyProximity(),
       );
-      this.updatePeerPositions(position, result.peerVolumes);
       this.audio.applyPeerVolumes(result.peerVolumes);
       this.volumeFailures = 0;
     } catch (e) {
@@ -398,45 +391,6 @@ export class Orchestrator {
     }
 
     this.broadcastOverlayState();
-  }
-
-  /**
-   * Work out which visible minimap icon belongs to which voice, and hand the
-   * result to the mixer for panning and reverb.
-   *
-   * Everything here comes from our own minimap — nothing is exchanged with
-   * other clients. That is what makes directional audio legitimate for
-   * enemies: an icon we can see is a position the game already gave us, while
-   * sending coordinates over the network would have been a wallhack.
-   */
-  private updatePeerPositions(self: Position, peerVolumes: Record<string, number>): void {
-    if (!this.audio || !this.tracking || !this.session) return;
-
-    const icons = this.tracking.getLastIcons();
-    const sides = this.peerSides();
-    const peers: AudiblePeer[] = [];
-    for (const [name, vol] of Object.entries(peerVolumes)) {
-      if (typeof vol !== 'number' || !Number.isFinite(vol) || vol <= 0) continue;
-      peers.push({ name, side: sides.get(name) === 'enemy' ? 'enemy' : 'ally', serverVol: vol });
-    }
-
-    const located = locatePeers({
-      self,
-      icons: icons.slice(),
-      peers,
-      previous: this.peerPositions,
-    });
-    this.peerPositions = located;
-
-    // Reverb follows the SPEAKER's surroundings, which is only knowable for
-    // someone we can actually see — an unseen speaker stays dry rather than
-    // borrowing our own surroundings and implying a location we don't have.
-    const wet = new Set<string>();
-    const mapType = this.session.mapType;
-    for (const [name, pos] of located) {
-      if (isInRiver(pos, mapType)) wet.add(name);
-    }
-    this.audio.setPeerPositions(self, located, wet);
   }
 
   /**
@@ -488,10 +442,6 @@ export class Orchestrator {
    * client must not paper over.
    */
   private applyFallbackVolumes(): void {
-    // No position of our own means no frame of reference, so drop every
-    // binding and centre everyone rather than panning against a stale one.
-    this.peerPositions = new Map();
-    this.audio?.setPeerPositions(null, new Map(), new Set());
     this.audio?.applyPeerVolumes(null);
   }
 

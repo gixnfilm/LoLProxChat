@@ -14,7 +14,6 @@ import {
   listAudioDevices,
   probeMicPermission,
 } from '../services/devices';
-import { getForceTurnRelay, setForceTurnRelay } from '../services/privacy';
 import {
   AudioPrefs, DEFAULT_AUDIO_PREFS, getAudioPrefs, setAudioPrefs, getPlayerVolumes,
   clearAllStoredSettings,
@@ -313,18 +312,6 @@ window.__proxchatRunUpdateCheck = runUpdateCheck;
 
 // Force-TURN privacy toggle. New peer connections created after this is
 // flipped honor the new setting; existing connections keep whatever policy
-// they were created with (would need to re-join the game to apply).
-const btnForceTurn = document.getElementById('btn-force-turn') as HTMLButtonElement;
-function syncForceTurnButton(): void {
-  const on = getForceTurnRelay();
-  btnForceTurn.textContent = on ? 'ON' : 'OFF';
-  btnForceTurn.classList.toggle('active', on);
-}
-registerResync(syncForceTurnButton);
-btnForceTurn.addEventListener('click', () => {
-  setForceTurnRelay(!getForceTurnRelay());
-  syncForceTurnButton();
-});
 
 // Voice mixer. Everything here is persisted in localStorage by audio-prefs and
 // pushed into the running AudioService, which also re-reads it when a new game
@@ -398,17 +385,7 @@ function bindMixerSlider(
 bindMixerSlider('input-master-vol', 'master-vol-label', 'masterVolume', r => r / 100, v => v * 100);
 bindMixerSlider('input-team-vol', 'team-vol-label', 'teamVolume', r => r / 100, v => v * 100);
 bindMixerSlider('input-enemy-vol', 'enemy-vol-label', 'enemyVolume', r => r / 100, v => v * 100);
-bindMixerSlider('input-stereo', 'stereo-label', 'stereoWidth', r => r / 100, v => v * 100);
 
-const btnReverb = document.getElementById('btn-reverb') as HTMLButtonElement;
-function syncReverbButton(on: boolean): void {
-  btnReverb.textContent = on ? 'ON' : 'OFF';
-  btnReverb.classList.toggle('active', on);
-}
-registerResync(() => syncReverbButton(getAudioPrefs().reverb));
-btnReverb.addEventListener('click', () => {
-  syncReverbButton(pushPrefs({ reverb: !getAudioPrefs().reverb }).reverb);
-});
 
 /**
  * Restore the factory state.

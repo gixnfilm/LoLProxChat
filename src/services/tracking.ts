@@ -1,6 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Position, MapType, MAP_DIMENSIONS } from '../core/types';
-import { IconObservation } from './peer-locator';
 import { getMinimapBounds, MinimapBounds } from '../core/map-calibration';
 import { ChampionClassifier } from './champion-classifier';
 import {
@@ -48,8 +47,6 @@ export class TrackingService {
   private currentFps = 30;
   // performance.now() when the in-flight tick started; 0 = idle.
   private tickStartedMs = 0;
-  // Icons from the most recent frame, in game units, minus our own.
-  private lastIcons: IconObservation[] = [];
   private onPositionUpdate: ((pos: Position) => void) | null = null;
 
   // Minimap region (detected or set by calibration/config)
@@ -869,7 +866,6 @@ export class TrackingService {
             mask = this.dilate(mask, region.width, region.height);
             const allBlobs = this.findBlobs(mask, region.width, region.height);
             const iconBlobs = this.filterIconBlobs(allBlobs);
-            this.cacheIconObservations(iconBlobs, region);
 
             // Regenerate the debug-mode filtered image at 5Hz (scan-rate independent).
             // This is what makes the debug overlay feel "live" without paying the
@@ -1197,48 +1193,13 @@ export class TrackingService {
   }
 
   /**
-   * Convert this frame's icons to game coordinates and keep them.
-   *
-   * Every icon — ally AND enemy — is already detected and validated by
-   * filterIconBlobs, and until now every enemy was discarded one line later,
-   * used for nothing but a debug stroke colour. They are what makes
-   * directional audio possible: an icon on our own minimap is information the
-   * game already gave us, so reading it back leaks nothing.
-   *
-   * Our own tracked icon is excluded — it is the listener, not a source.
-   */
-  private cacheIconObservations(
-    iconBlobs: Blob[],
-    region: { x: number; y: number; width: number; height: number },
-  ): void {
-    const out: IconObservation[] = [];
-    for (const b of iconBlobs) {
-      const cx = region.x + b.cx;
-      const cy = region.y + b.cy;
-      if (this.lastPixelPos) {
-        const dx = cx - this.lastPixelPos.x;
-        const dy = cy - this.lastPixelPos.y;
-        const selfRadius = Math.max(4, this.expectedIconDiam * 0.5);
-        if (dx * dx + dy * dy < selfRadius * selfRadius) continue;
-      }
-      out.push({
-        pos: this.pixelToGamePosition(cx, cy, region),
-        side: b.color === 'teal' ? 'ally' : 'enemy',
-      });
-    }
-    this.lastIcons = out;
-  }
-
-  /**
    * No usable frame this tick — the game is not on screen.
    *
    * Ages the position exactly as a frame containing no champions would, so
-   * every downstream staleness rule keeps working, and drops the cached icons
-   * so nothing pans against a position from minutes ago.
+   * every downstream staleness rule keeps working.
    */
   private handleBlackout(): void {
     const now = performance.now();
-    this.lastIcons = [];
     this.classifierScores.clear();
     this.smoothedClassifierScores.clear();
 
@@ -1256,15 +1217,6 @@ export class TrackingService {
     // fresh evidence rather than whatever was on the desktop.
     this.scanStartMs = now;
     this.scanFrameCount = 0;
-  }
-
-  /**
-   * Champion icons visible on the last scanned frame, in game coordinates,
-   * excluding our own. Empty while tracking has no lock, because without our
-   * own position there is nothing to measure direction against.
-   */
-  getLastIcons(): readonly IconObservation[] {
-    return this.state === TrackingState.LOCKED ? this.lastIcons : [];
   }
 
   /** Phase 2 success path: snap position, reset velocity, log, fire callback. */

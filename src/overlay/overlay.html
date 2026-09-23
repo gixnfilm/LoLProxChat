@@ -10,7 +10,7 @@
   <div id="panel" class="panel">
     <div id="drag-handle" class="widget-header" data-tauri-drag-region>
       <span class="widget-title" data-tauri-drag-region>LoLProxChat</span>
-      <span id="track-badge" class="track-badge hidden" title="Minimap tracking could not find your champion. Proximity and stereo need your own position, so enemies stay silent until this clears."></span>
+      <span id="track-badge" class="track-badge hidden" title="Minimap tracking could not find your champion. Proximity needs your own position, so enemies stay silent until this clears."></span>
       <div class="header-controls">
         <button id="btn-self-mute" class="icon-btn" title="Toggle Self Mute">MIC</button>
         <button id="btn-mute-all" class="icon-btn" title="Mute All">VOL</button>
@@ -82,22 +82,7 @@
         <label title="OFF = no distance falloff. ENEMY = only enemies fade with distance. ALL = teammates fade too. Takes effect on the next position update.">Proximity</label>
         <button id="btn-proximity-mode" class="icon-btn">ALL</button>
       </div>
-      <div class="setting-row">
-        <label title="How strongly a voice is pushed to the left or right depending on where that player stands relative to you. Needs their icon to be visible on your minimap; otherwise the voice stays centred.">Stereo</label>
-        <div class="setting-value-group">
-          <input id="input-stereo" type="range" min="0" max="150" step="5" value="100">
-          <span id="stereo-label" class="setting-value-label">100</span>
-        </div>
-      </div>
-      <div class="setting-row">
-        <label title="Adds a little reverb to voices coming from the river. Needs the speaker's icon to be visible on your minimap.">Reverb</label>
-        <button id="btn-reverb" class="icon-btn">ON</button>
-      </div>
       <div class="settings-heading">Other</div>
-      <div class="setting-row">
-        <label title="Routes all voice through the TURN relay so peers never see your public IP. Adds ~20-100ms latency. Takes effect on next peer connection.">Hide IP (Force TURN)</label>
-        <button id="btn-force-turn" class="icon-btn">OFF</button>
-      </div>
       <div class="setting-row">
         <label>Debug</label>
         <button id="btn-debug" class="icon-btn">OFF</button>
@@ -116,7 +101,7 @@
       </div>
       <div id="update-status" style="font-size:10px;color:#8892a8;padding:4px 0;text-align:center;"></div>
       <div class="setting-row">
-        <label title="WebAudio playback. Required for any volume above 100%, and for Stereo and Reverb. Turn OFF only if you hear echo or doubled voices.">Audio Boost</label>
+        <label title="WebAudio playback. Required for any volume above 100%. Turn OFF only if you hear echo or doubled voices.">Audio Boost</label>
         <button id="btn-audio-boost" class="icon-btn">ON</button>
       </div>
       <div class="setting-row">
