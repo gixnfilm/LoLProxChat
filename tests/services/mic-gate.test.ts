@@ -1,4 +1,7 @@
-import { levelPercent, updateGate, CLOSED_GATE, GateState } from '../../src/services/mic-gate';
+import {
+  levelPercent, updateGate, CLOSED_GATE, GateState, MIC_THRESHOLD_REFERENCE,
+} from '../../src/services/mic-gate';
+import { DEFAULT_AUDIO_PREFS } from '../../src/services/audio-prefs';
 
 describe('levelPercent', () => {
   test('silence reads as 0 and garbage does not produce NaN', () => {
@@ -13,11 +16,21 @@ describe('levelPercent', () => {
 
   test('gives usable resolution where people actually set the slider', () => {
     // The point of the square root: quiet speech must not all collapse into
-    // the first few slider positions. A linear scale would put this at 1.
-    const quiet = levelPercent(0.003);
-    expect(quiet).toBeGreaterThan(5);
-    expect(quiet).toBeLessThan(15);
-    expect(levelPercent(0.075)).toBeCloseTo(50, 0);
+    // the first few slider positions. A linear scale would put this at 4.
+    expect(levelPercent(MIC_THRESHOLD_REFERENCE.quietSpeech)).toBeCloseTo(20, 0);
+    expect(levelPercent(MIC_THRESHOLD_REFERENCE.ordinarySpeech)).toBeCloseTo(50, 0);
+  });
+
+  test('the shipped default sits at room tone, well below any speech', () => {
+    // This is the guard the earlier version lacked. The scale lived in
+    // mic-gate.ts, the default in audio-prefs.ts and a third estimate in a
+    // test comment, with nothing tying them together — so all three could
+    // disagree (and did) without a single test failing.
+    const d = DEFAULT_AUDIO_PREFS.micThreshold;
+    expect(levelPercent(MIC_THRESHOLD_REFERENCE.roomTone)).toBeCloseTo(d, 0);
+    // A very quiet sentence must clear the default with room to spare, or the
+    // gate silences people who believe they are talking.
+    expect(levelPercent(MIC_THRESHOLD_REFERENCE.quietSpeech)).toBeGreaterThan(d * 1.8);
   });
 });
 

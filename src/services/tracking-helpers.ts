@@ -236,3 +236,100 @@ export function shouldAbandonLock(challengeStartMs: number, nowMs: number): bool
   if (challengeStartMs <= 0) return false;
   return nowMs - challengeStartMs >= LOCK_CHALLENGE_MS;
 }
+
+/**
+ * Centre of League's camera box on the minimap, in region-relative pixels.
+ *
+ * The box is the bright rectangle showing which part of the map you are
+ * looking at. With the camera locked to your champion — League's default —
+ * its centre **is** your champion, which makes the entire "which teal ring am
+ * I?" problem disappear. The project's own research ranked this P0 and it was
+ * never built; the runs were already being detected here purely so they could
+ * be *excluded* from the white-pixel score, and the geometry thrown away.
+ *
+ * Returns null unless the shape is plausibly a camera box: it must be a
+ * decent fraction of the minimap, not almost all of it (that would be the
+ * minimap frame itself), and roughly landscape.
+ */
+export function computeViewportCenter(
+  viewportMask: Uint8Array, w: number, h: number,
+): { x: number; y: number } | null {
+  // Connected components, not a global bounding box.
+  //
+  // buildWhiteMasks marks EVERY white pixel in any run of >=12px as
+  // viewport: the camera rectangle, but also the minimap frame, ping
+  // animations, path lines and bright terrain. A min/max over all of them at
+  // once returns the midpoint between the box and whatever else was bright —
+  // a point with no meaning, which this then hands out as the player's
+  // position. Each component has to be measured on its own and judged on its
+  // own shape.
+  const seen = new Uint8Array(w * h);
+  const queue = new Int32Array(w * h);
+  let best: { x: number; y: number; score: number } | null = null;
+
+  for (let sy = 0; sy < h; sy++) {
+    for (let sx = 0; sx < w; sx++) {
+      const start = sy * w + sx;
+      if (viewportMask[start] !== 1 || seen[start] === 1) continue;
+
+      seen[start] = 1;
+      queue[0] = start;
+      let head = 0, tail = 1;
+      let minX = sx, maxX = sx, minY = sy, maxY = sy, count = 0;
+
+      while (head < tail) {
+        const idx = queue[head++];
+        const x = idx % w;
+        const y = (idx - x) / w;
+        count++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+
+        // 8-connected: the box outline is thin, and a 1px diagonal step is
+        // enough to break a 4-connected walk into separate pieces.
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = y + dy;
+          if (ny < 0 || ny >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx;
+            if (nx < 0 || nx >= w) continue;
+            const n = ny * w + nx;
+            if (viewportMask[n] !== 1 || seen[n] === 1) continue;
+            seen[n] = 1;
+            queue[tail++] = n;
+          }
+        }
+      }
+
+      const bw = maxX - minX + 1;
+      const bh = maxY - minY + 1;
+      if (count < 20) continue;
+      // Too small to be the camera box...
+      if (bw < w * 0.15 || bh < h * 0.10) continue;
+      // ...or large enough in EITHER axis to be the minimap frame. This was
+      // an && and therefore let a full-width, short mask through.
+      if (bw > w * 0.92 || bh > h * 0.92) continue;
+      // The camera box is wider than it is tall.
+      const aspect = bw / bh;
+      if (aspect < 0.9 || aspect > 3.5) continue;
+      // An outline, not a filled patch: the box is a rectangle border, so
+      // its pixel count is a fraction of its bounding-box area. A solid
+      // bright region that happens to be box-shaped is not the camera.
+      const fill = count / (bw * bh);
+      if (fill > 0.55) continue;
+      // A box clipped by the minimap edge reports a centre pulled inward by
+      // up to half its width — thousands of game units, in exactly the
+      // fountain case the fallback exists for.
+      if (minX === 0 || minY === 0 || maxX === w - 1 || maxY === h - 1) continue;
+
+      const score = bw * bh;
+      if (!best || score > best.score) {
+        best = { x: minX + bw / 2, y: minY + bh / 2, score };
+      }
+    }
+  }
+
+  return best ? { x: best.x, y: best.y } : null;
+}

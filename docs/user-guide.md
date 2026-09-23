@@ -30,10 +30,11 @@ Each player row has:
 |---|---|
 | **Input Device** | Which microphone to use. "Default" follows Windows' default communications device. Selection persists across launches. Switching mid-game swaps the source in place — no peer reconnection needed. |
 | **Output Device** | Which speaker / headset to send voice to. Same persistence behavior. |
-| **Input Mode** | "Always Open" (default) — mic is always live unless self-muted. "Push to Talk" — hold the bound PTT key (default Caps Lock) to transmit; it works while League has focus. |
+| **Input Mode** | "Always Open" (default) — transmits whenever your level clears **Mic Threshold**. "Push to Talk" — hold the bound PTT key (default Caps Lock) to transmit; it works while League has focus. Your choice persists across games and restarts. |
 | **PTT Key** | The push-to-talk key. Default Caps Lock (the keyboard LED is auto-flipped back so it doesn't toggle on every press). Click the button to capture a new key; the app rejects common LoL bindings (Q/W/E/R/D/F/B/P) and modifier-only keys. |
 | **Toggle-mute Key** | Optional global hotkey to flip self-mute on/off. Unbound by default — click the button to bind. |
 | **Mic Volume** | Pre-transmission gain on your mic, 0-100%. Useful if your hardware mic is too quiet or too hot. Persists across launches. |
+| **Mic Threshold** | How loud you have to be before anything is sent, 0-100 (default 10). Below it, nothing goes out — that is what keeps your keyboard and your fan off the channel. The bar underneath shows your live level and turns green while you are actually being transmitted; the marker is your threshold. Set the marker above where typing peaks and below where your voice sits. **0 disables it** and transmits continuously, which is how the app behaved before v0.8.0. Push to Talk ignores it. |
 
 ### Voice Mixer
 

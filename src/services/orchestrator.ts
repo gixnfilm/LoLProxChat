@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { GameStateService, GameSession, TauriGameState } from './game-state';
 import { SignalingService, SignalMessage, PositionBroadcast } from './signaling';
-import { AudioService, PeerSide } from './audio';
+import { AudioService, PeerSide, FallbackReason } from './audio';
 import { TrackingService, TrackingState } from './tracking';
 import { ChampionClassifier } from './champion-classifier';
 import { VolumeClient } from './volume-client';
@@ -387,7 +387,11 @@ export class Orchestrator {
         console.error('[LoLProxChat] Volume computation failed (' +
           this.volumeFailures + ' in a row):', e);
       }
-      this.applyFallbackVolumes();
+      // NOT 'no-position': our tracking is fine, the request failed. Passing
+      // the default here made a server hiccup indistinguishable from losing
+      // yourself on the minimap, and since losing yourself now fades the team
+      // out, a 429 or a three-second timeout silenced everyone.
+      this.applyFallbackVolumes('request-failed');
     }
 
     this.broadcastOverlayState();
@@ -441,8 +445,8 @@ export class Orchestrator {
    * enemy is never synthesised — the server's range cut-off is a boundary the
    * client must not paper over.
    */
-  private applyFallbackVolumes(): void {
-    this.audio?.applyPeerVolumes(null);
+  private applyFallbackVolumes(reason: FallbackReason = 'no-position'): void {
+    this.audio?.applyPeerVolumes(null, reason);
   }
 
   /**

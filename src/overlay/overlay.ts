@@ -408,7 +408,7 @@ function resetAllSettings(): void {
   sendToBackground('updateAudioPrefs', getAudioPrefs());
   sendToBackground('updateSettings', {
     inputVolume: DEFAULT_AUDIO_PREFS.inputVolume,
-    inputMode: 'always',
+    inputMode: DEFAULT_AUDIO_PREFS.inputMode,
   });
   sendToBackground('setInputDevice', { id: null });
   sendToBackground('setOutputDevice', { id: null });
@@ -568,8 +568,16 @@ if (panelEl) {
 }
 window.addEventListener('DOMContentLoaded', syncOverlayHeight);
 
-document.getElementById('input-mode')!.addEventListener('change', (e) => {
-  const mode = (e.target as HTMLSelectElement).value;
+const inputModeSelect = document.getElementById('input-mode') as HTMLSelectElement;
+registerResync(() => {
+  // Without this the select showed whatever the HTML hardcoded while the
+  // engine ran on something else. It is also what Reset All needs in order to
+  // actually move the control rather than only the engine behind it.
+  inputModeSelect.value = getAudioPrefs().inputMode;
+});
+inputModeSelect.addEventListener('change', () => {
+  const mode = inputModeSelect.value === 'ptt' ? 'ptt' : 'always';
+  pushPrefs({ inputMode: mode });
   sendToBackground('updateSettings', { inputMode: mode });
 });
 
@@ -626,6 +634,15 @@ window.addEventListener('micLevel', ((e: CustomEvent) => {
   // knows all three.
   micMeterFill.classList.toggle('open', transmitting);
 }) as EventListener);
+
+// When the game ends the 40 Hz events simply stop, so without this the bar
+// keeps whatever width and colour it had at the final tick — a game ending
+// mid-sentence left it wide and green, asserting a live transmission in a
+// panel that stays open between matches, with no mic stream behind it.
+window.addEventListener('sessionEnded', () => {
+  micMeterFill.style.width = '0%';
+  micMeterFill.classList.remove('open');
+});
 
 const scanRateInput = document.getElementById('input-scan-rate') as HTMLInputElement;
 const scanRateLabel = document.getElementById('scan-rate-label')!;

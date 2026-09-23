@@ -50,6 +50,12 @@ export interface AudioPrefs {
   audioBoost: boolean;
   /** Pre-transmission mic gain, 0..1. Mirrors AudioSettings.inputVolume. */
   inputVolume: number;
+  /** 'always' transmits whenever the gate opens; 'ptt' only while the key is
+   *  held. Persisted here because it previously was not persisted anywhere:
+   *  a fresh AudioService is built per game and defaulted to 'always', while
+   *  the overlay window is never reloaded and kept showing "Push to Talk". A
+   *  PTT user therefore had a hot mic from their second game onward. */
+  inputMode: 'ptt' | 'always';
   /** Voice-gate threshold on the 0..100 meter scale. 0 disables the gate, so
    *  Always Open transmits continuously the way it always did. */
   micThreshold: number;
@@ -65,10 +71,13 @@ export const DEFAULT_AUDIO_PREFS: Readonly<AudioPrefs> = Object.freeze({
   fadeCurve: 0.7,
   audioBoost: true,
   inputVolume: 1.0,
-  // Low on purpose. Browser noise suppression already runs on the mic, so
-  // room tone sits near zero and 10 is enough to stop a keyboard without
-  // clipping the start of a quiet sentence. The meter next to the slider is
-  // there so this can be corrected in seconds rather than guessed at.
+  inputMode: 'always' as 'ptt' | 'always',
+  // 10 is the room-tone reference point in mic-gate.ts (RMS 0.003, -50 dBFS),
+  // which sits a factor of four below even a very quiet sentence. Low on
+  // purpose: browser noise suppression already runs on the mic, so this is
+  // enough to stop a keyboard without clipping the start of a sentence, and
+  // the meter next to the slider is there so it can be corrected in seconds
+  // rather than guessed at. 0 disables the gate entirely.
   micThreshold: 10,
 });
 
@@ -127,6 +136,9 @@ export function getAudioPrefs(): AudioPrefs {
       ? stored.audioBoost
       : DEFAULT_AUDIO_PREFS.audioBoost,
     inputVolume: num(stored.inputVolume, DEFAULT_AUDIO_PREFS.inputVolume, 0, 1),
+    // Anything unrecognised falls back to the default rather than to 'ptt':
+    // a corrupt entry must not leave someone unable to talk at all.
+    inputMode: stored.inputMode === 'ptt' ? 'ptt' : DEFAULT_AUDIO_PREFS.inputMode,
     micThreshold: num(stored.micThreshold, DEFAULT_AUDIO_PREFS.micThreshold, 0, 100),
   };
 }

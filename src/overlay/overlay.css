@@ -228,10 +228,10 @@ html, body {
 .mic-meter {
   position: relative;
   height: 6px;
-  margin: 0 0 6px;
+  /* Room for the marker, which deliberately overhangs the bar. */
+  margin: 2px 0 8px;
   background: rgba(100, 120, 160, 0.18);
   border-radius: 3px;
-  overflow: hidden;
 }
 .mic-meter-fill {
   position: absolute;
@@ -241,6 +241,8 @@ html, body {
   width: 0;
   background: #5a6480;
   border-radius: 3px;
+  /* The bar clips itself rather than the parent clipping the marker. */
+  overflow: hidden;
   /* Fast enough to feel live, slow enough not to strobe at 40 Hz. */
   transition: width 60ms linear, background-color 90ms linear;
 }
@@ -250,7 +252,8 @@ html, body {
   top: -2px;
   bottom: -2px;
   width: 2px;
-  margin-left: -1px;
+  /* Centred on its value, and at 100% it must not hang off the right edge. */
+  transform: translateX(-1px);
   background: #cdcdcd;
   border-radius: 1px;
 }

@@ -4,6 +4,55 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.8.1] — 2026-09-23
+
+Fixes for defects a code review found in v0.8.0, several of them introduced by
+v0.8.0 itself. **Upgrade over v0.8.0.**
+
+### Fixed — regressions in v0.8.0
+- **A server hiccup silenced your whole team.** v0.8.0 started treating "no
+  position" as "too far away", which was right — but the code could not tell a
+  lost position apart from a failed HTTP request, and after five seconds of a
+  429 or a timeout everyone faded to silence with tracking working perfectly.
+  A failed request now falls back to "audible" instead: we know where we are,
+  we simply could not ask.
+- **The classifier could latch as "usable" with no scores at all**, which
+  brought back the exact skip-every-blob bug v0.8.0 set out to fix — one line
+  below the comment describing it. Alt-tab was enough to trigger it.
+- **Dragging Mic Threshold cut your voice mid-word**, on every step of the
+  drag — while the tooltip tells you to talk while dragging.
+- **The mic meter measured the wrong side of the Mic Volume slider.** With Mic
+  Volume low, the bar could read full and green while peers heard silence.
+- **~350 ms of ungated audio went out on every unmute**, including the click of
+  the unmute key itself.
+
+### Fixed — camera-box tracking
+- **The camera-box centre was computed from the whole bright mask at once.**
+  Any second long white run — the minimap frame, a path line, a ping — dragged
+  the "centre" to a midpoint belonging to neither, and that point was handed out
+  as your position. It is now found per connected shape, and a box clipped by
+  the minimap edge, a filled patch, or the frame itself are all rejected. Now
+  under test.
+- **A camera-box lock confirmed itself forever.** Its centre became our
+  position, so it kept scoring itself highest, while a zeroed hold timer
+  silenced the forced re-acquisition, the watchdog and the lost-tracking badge
+  simultaneously. It is provisional now: unconfirmed by a real icon within five
+  seconds, it is dropped.
+- **A single blank frame re-armed the clock** that the camera-box fallback waits
+  on, so in a flickering capture the fallback never fired — precisely the case
+  it was written for.
+- The classifier can no longer teleport the position on relative confidence
+  alone; long-range re-acquisition now needs absolute confidence as well.
+- Two champion icons fused into one blob are rejected instead of reporting the
+  midpoint between two players.
+
+### Fixed — older bugs found along the way
+- **Push to Talk was never saved.** A fresh audio engine is built per game and
+  defaulted to Always Open while the overlay still showed "Push to Talk" — so
+  from your second game on, a PTT user had a hot mic. Now persisted, and the
+  dropdown reflects what is actually running.
+- The mic meter no longer freezes at its last width and colour between games.
+
 ## [v0.8.0] — 2026-09-23
 
 Back to basics: hear people who are near you, don't hear people who aren't.

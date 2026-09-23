@@ -9,6 +9,9 @@ import {
 import { resolvePeerLevel, computeFinalPeerVolume, TickSample } from './proximity-curve';
 import { levelPercent, updateGate, GateState, CLOSED_GATE } from './mic-gate';
 
+/** Why a tick carried no server data. */
+export type FallbackReason = 'no-position' | 'request-failed';
+
 export { computeFinalPeerVolume };
 
 /** Which side of the scoreboard a peer is on, for the Team / Enemy gains. */
@@ -73,6 +76,10 @@ export class AudioService {
   // everyone is still in the fountain and should hear each other; afterwards,
   // losing the position means losing it. See allyUnknownLevel.
   private everTracked = false;
+  // Why the last tick carried no server data. 'request-failed' means our
+  // position was fine and the HTTP call was not, which is a different
+  // situation entirely — see the everTracked argument in levelFor.
+  private lastFallbackReason: FallbackReason = 'no-position';
   // Throttling state for the verbose applyPeerVolumes snapshot log
   private lastVolumeLogLine = '';
   private lastVolumeLogMs = 0;
@@ -128,6 +135,7 @@ export class AudioService {
     this.localName = localName;
     this.settings.playerVolumes = getPlayerVolumes();
     this.settings.inputVolume = this.prefs.inputVolume;
+    this.settings.inputMode = this.prefs.inputMode;
   }
 
   /**
@@ -269,7 +277,12 @@ export class AudioService {
     if (!this.audioContext) return;
     this.micLevelAnalyser = this.audioContext.createAnalyser();
     this.micLevelAnalyser.fftSize = 1024;
-    micSource.connect(this.micLevelAnalyser);
+    // Deliberately fed from the VOLUME node, not from micSource: the gate and
+    // the meter have to measure the signal that actually leaves the machine.
+    // Tapped ahead of the slider, Mic Volume 0 showed a full green bar while
+    // peers received silence — a meter that says "you are being heard" when
+    // you are not is worse than no meter.
+    (this.gainNode ?? micSource).connect(this.micLevelAnalyser);
 
     // The destination node is a sink — to monitor its output we need to
     // re-source from its stream via a second source node.
@@ -297,7 +310,7 @@ export class AudioService {
       console.log(
         '[Audio] mic=' + micPeak.toFixed(3) +
         ' level=' + levelPercent(micPeak).toFixed(0) +
-        ' gate=' + (this.prefs.micThreshold > 0
+        ' gate=' + (this.gateActive()
           ? (this.gate.open ? 'open' : 'shut') + '@' + this.prefs.micThreshold
           : 'off') +
         ' out=' + outPeak.toFixed(3) +
@@ -327,9 +340,21 @@ export class AudioService {
       // Push-to-talk and self-mute already gate the track outright; layering a
       // second gate on top would only add a way for them to disagree.
       const gated = this.settings.inputMode !== 'ptt' && !this.selfMuted;
-      const threshold = gated ? this.prefs.micThreshold : 0;
-      this.gate = updateGate(this.gate, level, threshold, performance.now(), GATE_HOLD_MS);
-      this.applyGateGain(this.gate.open);
+      if (gated) {
+        this.gate = updateGate(
+          this.gate, level, this.prefs.micThreshold, performance.now(), GATE_HOLD_MS,
+        );
+      } else {
+        // Do NOT run the gate with threshold 0 here. That returns open and
+        // re-stamps lastAboveMs 40 times a second, so the moment you unmute,
+        // the hold sees a 25 ms old stamp and keeps the mic open for another
+        // 300 ms — including the click of the unmute key itself. Park it
+        // closed instead; the track is already hard-disabled in both modes.
+        this.gate = CLOSED_GATE;
+      }
+      // The gain node still has to open, because in PTT and while muted the
+      // muting is done on the track, not here.
+      this.applyGateGain(!gated || this.gate.open);
 
       // One boolean, decided here. Letting the overlay combine mute + PTT +
       // gate itself would be a second copy of the rule, and a meter that says
@@ -339,6 +364,18 @@ export class AudioService {
         detail: { level, transmitting },
       }));
     }, GATE_INTERVAL_MS) as unknown as number;
+  }
+
+  /**
+   * Whether the voice gate is actually deciding anything right now.
+   *
+   * Push-to-talk and self-mute gate the track outright, so the voice gate is
+   * bypassed in both — and a log line claiming "gate=open@10" in those modes
+   * points the reader at the wrong suspect.
+   */
+  private gateActive(): boolean {
+    return this.prefs.micThreshold > 0 &&
+      this.settings.inputMode !== 'ptt' && !this.selfMuted;
   }
 
   /**
@@ -560,14 +597,18 @@ export class AudioService {
    */
   applyAudioPrefs(prefs: AudioPrefs): void {
     const boostChanged = prefs.audioBoost !== this.prefs.audioBoost;
-    const thresholdChanged = prefs.micThreshold !== this.prefs.micThreshold;
     this.prefs = prefs;
-    // Lowering the threshold below a currently-quiet level should open the
-    // gate now, not on the next syllable — otherwise dragging the slider
-    // appears to do nothing until you speak again.
-    if (thresholdChanged) this.gate = CLOSED_GATE;
+    // No gate reset here. A previous version cleared the gate on every
+    // threshold change, claiming it made a lowered threshold take effect
+    // immediately — but CLOSED_GATE is *closed*, so it did the opposite: it
+    // discarded the hold and the hysteresis and cut you off mid-word on every
+    // single step of a slider drag, which is exactly the moment the tooltip
+    // tells you to be talking. Immediacy needs no help: the 25 ms loop re-reads
+    // prefs.micThreshold on every pass.
     this.settings.inputVolume = prefs.inputVolume;
+    this.settings.inputMode = prefs.inputMode;
     this.applyInputVolume();
+    this.updateLocalTrackState();
 
     if (boostChanged) {
       if (prefs.audioBoost) {
@@ -626,7 +667,11 @@ export class AudioService {
       msSinceSeen: st?.seenAtMs === undefined ? undefined : now - st.seenAtMs,
       graceMs: PROXIMITY_GRACE_MS,
       allyHoldMs: ALLY_NO_DATA_HOLD_MS,
-      everTracked: this.everTracked,
+      // A failed request is not evidence about distance in either direction:
+      // we know where we are, we simply could not ask. Treating it as "we lost
+      // our position" would fade the whole team out over a server hiccup, so
+      // it falls back to the start-of-game rule instead.
+      everTracked: this.everTracked && this.lastFallbackReason !== 'request-failed',
     });
     const next: PeerVolumeState = { ...(st ?? {}), lastLevel: shaped };
     this.peerVolumeState.set(name, next);
@@ -650,9 +695,13 @@ export class AudioService {
    *
    * On a null tick nothing is stamped and nothing is cached as server data.
    */
-  applyPeerVolumes(volumes: Record<string, number> | null): void {
+  applyPeerVolumes(
+    volumes: Record<string, number> | null,
+    reason: FallbackReason = 'no-position',
+  ): void {
     const now = performance.now();
     const fresh = volumes !== null;
+    this.lastFallbackReason = fresh ? 'no-position' : reason;
 
     // Drop anything non-numeric before it reaches the maths. The response is
     // parsed from JSON, and a single null / string entry used to throw here
@@ -899,12 +948,6 @@ export class AudioService {
       this.localStream = newStream;
       this.micSource = this.audioContext.createMediaStreamSource(newStream);
       this.micSource.connect(this.gainNode);
-      // disconnect() above cut the level analyser loose along with everything
-      // else, and nothing reconnected it — the mic= figure in the log has been
-      // reading a flat 0.000 after every device switch. Harmless while it was
-      // only a log line; now the voice gate reads the same number and would
-      // stay shut for the rest of the game.
-      if (this.micLevelAnalyser) this.micSource.connect(this.micLevelAnalyser);
       this.updateLocalTrackState();
       console.log('[Audio] Input device switched');
     } catch (e) {

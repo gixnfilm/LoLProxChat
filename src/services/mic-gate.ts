@@ -14,10 +14,31 @@
  *
  * Square-rooted rather than linear because loudness is not: on a linear scale
  * ordinary speech sits in the bottom fifth of the range and every useful
- * threshold would be crammed into the first few slider positions. Here quiet
- * speech lands around 20-40 and a raised voice near 100, so the slider has
- * usable resolution exactly where people set it.
+ * threshold would be crammed into the first few slider positions.
+ *
+ * Reference points, so the default threshold and the tests cannot drift apart
+ * from each other the way three separate prose estimates did:
+ *
+ *   RMS 0.003  (-50 dBFS) → 10   room tone, a keyboard two desks away
+ *   RMS 0.012  (-38 dBFS) → 20   a very quiet sentence
+ *   RMS 0.075  (-22 dBFS) → 50   ordinary speech
+ *   RMS 0.300  ( -10 dBFS) → 100 shouting
+ *
+ * DEFAULT_AUDIO_PREFS.micThreshold sits at the first of these, which is why
+ * MIC_THRESHOLD_REFERENCE below is asserted in the tests.
  */
+/**
+ * The calibration points the default threshold is chosen against. Exported so
+ * a test pins them: the scale, the default and the prose above have to agree,
+ * and previously three different numbers were written in three files with
+ * nothing connecting them.
+ */
+export const MIC_THRESHOLD_REFERENCE: Readonly<Record<string, number>> = Object.freeze({
+  roomTone: 0.003,
+  quietSpeech: 0.012,
+  ordinarySpeech: 0.075,
+});
+
 export function levelPercent(rms: number): number {
   if (!Number.isFinite(rms) || rms <= 0) return 0;
   return Math.min(100, Math.sqrt(rms / 0.3) * 100);
