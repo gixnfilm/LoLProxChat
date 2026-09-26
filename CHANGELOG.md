@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format adapted from [Ke
 
 ## [Unreleased]
 
+## [v0.8.2] — 2026-09-26
+
+### Changed
+- Champion classifier retrained on the current-patch Community Dragon icon set (game patch 16.19.1).
+
 ## [v0.8.1] — 2026-09-23
 
 Fixes for defects a code review found in v0.8.0, several of them introduced by
@@ -711,6 +716,7 @@ falloff is configurable instead of fixed.
 Initial public iteration: Overwolf → Tauri 2 migration, Supabase-stack → custom 1-container WebSocket signaling server, minimap CV pipeline (HSV color filter + blob detection + ONNX champion classifier), WebRTC P2P voice with AES-GCM encrypted position blobs computed server-side, in-app updater. See `docs/plans/` for the historical design + implementation documents from that period.
 
 [Unreleased]: https://github.com/danthi123/LoLProxChat/compare/v0.4.4...HEAD
+[v0.8.2]: https://github.com/danthi123/LoLProxChat/releases/tag/v0.8.2
 [v0.8.0]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.8.0
 [v0.7.2]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.2
 [v0.7.1]: https://github.com/gixnfilm/LoLProxChat/releases/tag/v0.7.1
